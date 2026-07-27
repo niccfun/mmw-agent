@@ -155,6 +155,13 @@ jobs:
         env:
           AGENT_UPDATE_PRIVATE_KEY: ${{ secrets.AGENT_UPDATE_PRIVATE_KEY }}
         run: |
+          if [ -z "$AGENT_UPDATE_PRIVATE_KEY" ]; then
+            echo "::error::缺少 GitHub Secret: AGENT_UPDATE_PRIVATE_KEY"
+            echo "到仓库 Settings → Secrets and variables → Actions 新增 Secret"
+            echo "Name=AGENT_UPDATE_PRIVATE_KEY  Value=Ed25519私钥base64(64字节)"
+            echo "对应公钥在 internal/selfupdate/verify.go 的 PubKeyB64"
+            exit 1
+          fi
           cd tools/sign
           go run . \
             ../../release/mmw-agent-linux-amd64 \

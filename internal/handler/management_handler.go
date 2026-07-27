@@ -5403,9 +5403,9 @@ esac
 # 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 会快速失败(近乎即时,
 # 非超时)后降级到 ghproxy / gh-proxy(v4+v6 双栈反代)。
 MIRRORS=(
-    "https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://mirror.ghproxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://github.com/nuxproio/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://gh-proxy.com/https://github.com/nuxproio/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://mirror.ghproxy.com/https://github.com/nuxproio/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 )
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then

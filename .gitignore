@@ -44,3 +44,7 @@ CLAUDE.md
 sign-local.sh.example
 sign-local.sh
 *_test.go
+
+# 本地 agent 升级签名私钥(切勿提交)
+.agent-update-private-key.b64
+*.private-key*
