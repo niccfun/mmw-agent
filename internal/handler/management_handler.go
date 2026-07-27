@@ -4624,7 +4624,6 @@ func (h *ManageHandler) ensureRoutingRules(config map[string]interface{}) bool {
 	// 到这里说明 routing 没有 rules 数组(全新 / 遗留空配置)→ 注入一次默认规则(保留已有 domainStrategy)。
 	routing["rules"] = []interface{}{
 		map[string]interface{}{"type": "field", "protocol": []interface{}{"bittorrent"}, "marktag": "ban_bt", "outboundTag": "block"},
-		map[string]interface{}{"type": "field", "ip": []interface{}{"geoip:cn"}, "marktag": "ban_geoip_cn", "outboundTag": "block"},
 		map[string]interface{}{"type": "field", "ip": []interface{}{"geoip:private"}, "outboundTag": "block"},
 	}
 	return true

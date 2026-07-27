@@ -54,14 +54,6 @@
             {
                 "type": "field",
                 "ip": [
-                    "geoip:cn"
-                ],
-                "marktag": "ban_geoip_cn",
-                "outboundTag": "block"
-            },
-            {
-                "type": "field",
-                "ip": [
                     "geoip:private"
                 ],
                 "outboundTag": "block"

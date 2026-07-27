@@ -48,7 +48,6 @@ fi
 # geoip.dat / geosite.dat
 #
 # embedded xray 启动前必须有这两个文件(main.go L137 ensureGeoData 同步阻塞),
-# 没有 routing 解析 geoip:cn 会 panic。镜像第一次起 / volume 挂 /usr/local/bin 时
 # 可能没文件,这里下到 binary 同目录(agent 用 os.Executable() 找 dat)。
 # ───────────────────────────────────────────────────────────────────
 GEO_DIR="/usr/local/bin"

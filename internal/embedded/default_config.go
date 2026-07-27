@@ -54,14 +54,6 @@ const DefaultConfigJSON = `{
             {
                 "type": "field",
                 "ip": [
-                    "geoip:cn"
-                ],
-                "marktag": "ban_geoip_cn",
-                "outboundTag": "block"
-            },
-            {
-                "type": "field",
-                "ip": [
                     "geoip:private"
                 ],
                 "outboundTag": "block"
@@ -150,14 +142,6 @@ const TunnelConfigJSON = `{
                     "bittorrent"
                 ],
                 "marktag": "ban_bt",
-                "outboundTag": "block"
-            },
-            {
-                "type": "field",
-                "ip": [
-                    "geoip:cn"
-                ],
-                "marktag": "ban_geoip_cn",
                 "outboundTag": "block"
             },
             {

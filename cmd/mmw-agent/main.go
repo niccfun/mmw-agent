@@ -301,7 +301,6 @@ func main() {
 
 	// geoip.dat / geosite.dat 不分 mode 都要准备好 — 主控的 xray test-config 在 external mode
 	// 下若 LookPath("xray") 失败(典型: xray 还在 install 流程中)会 fallback 走 xray-core 库
-	// 解析,这条路径解析 `geoip:cn` 之类规则时必须能找到 dat 文件,否则 test 报错
 	// "open /usr/local/bin/geoip.dat: no such file or directory",主控首次 auto-deploy
 	// tunnel 配置直接失败。external mode 异步下载(不阻塞 agent 启动,有就跳过);
 	// embedded mode 必须同步 — 内嵌 xray instance.New 会预解析 routing,无 dat 就 panic,
@@ -663,7 +662,6 @@ func (g *listenGate) stop() {
 //
 // 背景:GitHub Release 重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
 // 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直接 connect: network is unreachable → geoip.dat
-// 拿不到 → 嵌入式 xray 启动 routing 引用 geoip:cn 加载失败 → server 整个起不来。
 //
 // jsdelivr 全球 CDN 同时提供 v4/v6;ghproxy 同款。GitHub 原始保留兜底(国内有 v4 时可达)。
 var geoMirrorTemplates = []string{
