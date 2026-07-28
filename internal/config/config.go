@@ -122,7 +122,7 @@ func Load(path string) (*Config, error) {
 func fromEnvRaw() *Config {
 	config := &Config{
 		MasterURL:      os.Getenv("MMWX_MASTER_URL"),
-		Token:          firstNonEmpty(os.Getenv("MMWX_TOKEN"), os.Getenv("MMWX_MASTER_TOKEN")),
+		Token:          firstNonEmpty(os.Getenv("MMWX_MASTER_TOKEN"), os.Getenv("MMWX_TOKEN")),
 		ConnectionMode: os.Getenv("MMWX_CONNECTION_MODE"),
 		ListenPort:     os.Getenv("MMWX_LISTEN_PORT"),
 		XrayMode:       os.Getenv("MMWX_XRAY_MODE"),
@@ -263,8 +263,12 @@ func (c *Config) discoverXrayServers() []XrayServer {
 
 // 校验配置是否合法。
 func (c *Config) Validate() error {
-	if c.ConnectionMode != constants.ConnectionModePull && c.Token == "" {
-		// 兼容空 token，实际仅拉取模式可正常工作
+	// pull 模式可由主控反向拉,允许无 token;其余模式连主控必须带 token。
+	if c.ConnectionMode != constants.ConnectionModePull && strings.TrimSpace(c.Token) == "" {
+		return fmt.Errorf("token empty: set MMWX_MASTER_TOKEN or MMWX_TOKEN, or config.yaml token")
+	}
+	if strings.TrimSpace(c.MasterURL) == "" && c.ConnectionMode != constants.ConnectionModePull {
+		return fmt.Errorf("master_url empty: set MMWX_MASTER_URL or config.yaml master_url")
 	}
 	return nil
 }

@@ -68,4 +68,19 @@ for dat in geoip.dat geosite.dat; do
 done
 
 # 启动 agent
+# auto-attach /etc/mmw-agent/config.yaml when present
+if [ -f /etc/mmw-agent/config.yaml ]; then
+    has_config=0
+    for a in "$@"; do
+        case "$a" in
+            -c|--config|-config) has_config=1; break ;;
+        esac
+    done
+    if [ "$has_config" = 0 ]; then
+        agent_bin="$1"
+        shift
+        set -- "$agent_bin" -c /etc/mmw-agent/config.yaml "$@"
+    fi
+fi
+
 exec "$@"

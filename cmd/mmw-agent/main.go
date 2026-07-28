@@ -218,10 +218,13 @@ func main() {
 	if cfgFile == "" {
 		cfgFile = *configPathShort
 	}
-	// 默认读取工作目录下的 config.yaml
+	// default config: -c > ./config.yaml > /etc/mmw-agent/config.yaml
 	if cfgFile == "" {
-		if _, err := os.Stat("config.yaml"); err == nil {
-			cfgFile = "config.yaml"
+		for _, candidate := range []string{"config.yaml", "/etc/mmw-agent/config.yaml"} {
+			if _, err := os.Stat(candidate); err == nil {
+				cfgFile = candidate
+				break
+			}
 		}
 	}
 
@@ -258,6 +261,21 @@ func main() {
 	// embedded 模式 agent 内联 xray 承载所有代理连接,设内存软上限让 GC 更早回收、抑制 RSS 暴涨。
 	setupMemoryLimit(cfg.XrayMode == "embedded")
 
+	if cfg.Token == "" {
+		log.Printf("[Main] WARN: token empty (pull mode only)")
+	} else {
+		tok := cfg.Token
+		masked := tok
+		if len(tok) > 8 {
+			masked = tok[:4] + "..." + tok[len(tok)-4:]
+		}
+		log.Printf("[Main] token loaded (%s, len=%d)", masked, len(tok))
+	}
+	if cfgFile != "" {
+		log.Printf("[Main] config file: %s", cfgFile)
+	} else {
+		log.Printf("[Main] config source: environment only")
+	}
 	log.Printf("[Main] Starting mmw-agent")
 	log.Printf("[Main] Log file: %s", cfg.LogPath)
 	log.Printf("[Main] Connection mode: %s", cfg.ConnectionMode)
