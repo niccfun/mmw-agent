@@ -122,7 +122,7 @@ func Load(path string) (*Config, error) {
 func fromEnvRaw() *Config {
 	config := &Config{
 		MasterURL:      os.Getenv("MMWX_MASTER_URL"),
-		Token:          os.Getenv("MMWX_TOKEN"),
+		Token:          firstNonEmpty(os.Getenv("MMWX_TOKEN"), os.Getenv("MMWX_MASTER_TOKEN")),
 		ConnectionMode: os.Getenv("MMWX_CONNECTION_MODE"),
 		ListenPort:     os.Getenv("MMWX_LISTEN_PORT"),
 		XrayMode:       os.Getenv("MMWX_XRAY_MODE"),
@@ -267,4 +267,14 @@ func (c *Config) Validate() error {
 		// 兼容空 token，实际仅拉取模式可正常工作
 	}
 	return nil
+}
+
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
