@@ -49,6 +49,11 @@ curl -sL https://raw.githubusercontent.com/nuxproio/mmw-agent/main/install.sh | 
 <details>
 <summary>更新日志</summary>
 
+### v0.4.3 (2026-07-31)
+- 🌈 增加cdn更新
+- 🛠️ fix: 不再始终更新master_url
+- 🛠️ fix: 去除默认的geoipcn规则
+
 ### v0.4.2 (2026-07-26)
 - 🌈 增加cdn更新
 - 🌈 支持mieru协议
