@@ -5880,6 +5880,16 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "master_url:") {
+			current := strings.TrimSpace(strings.TrimPrefix(trimmed, "master_url:"))
+			current = strings.Trim(current, `"'`)
+			if sameMasterURL(current, req.MasterURL) {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"success":   true,
+					"unchanged": true,
+					"message":   "master_url already up to date",
+				})
+				return
+			}
 			lines[i] = "master_url: " + req.MasterURL
 			found = true
 			break
@@ -5909,6 +5919,13 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 		log.Printf("[Manage] Exiting for master_url update (systemd will restart)")
 		os.Exit(0)
 	}()
+}
+
+func sameMasterURL(a, b string) bool {
+	normalize := func(value string) string {
+		return strings.TrimRight(strings.TrimSpace(value), "/")
+	}
+	return normalize(a) != "" && normalize(a) == normalize(b)
 }
 
 // ensureExternalXray 确保外部 Xray 已安装、启用并启动。
