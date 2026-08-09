@@ -5605,7 +5605,7 @@ if ! "$SELF_BIN" __verify-update /tmp/mmw-agent-new /tmp/mmw-agent-new.sig; then
 fi
 echo "Signature OK."
 
-# 替换二进制(systemd Restart=always 会在 agent 退出后拉起新版本)。
+# 替换二进制；完成后 agent 会原地 exec 新版本，不依赖特定 init 系统。
 # 直接 cp 到 /usr/local/bin/mmw-agent 会触发 "Text file busy",因为正在运行的 mmw-agent 进程占着该 inode。
 # 改成"先 cp 到旁路文件,再原子 mv 覆盖" — Linux rename(2) 不影响正在执行的进程映射的旧 inode,
 # 新 inode 接管该路径,旧 inode 直到进程退出才释放。
@@ -5613,7 +5613,7 @@ cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new
 chmod +x /usr/local/bin/mmw-agent.new
 mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent
 rm -f /tmp/mmw-agent-new
-echo "Binary replaced; agent will exit and systemd will restart with new version."
+echo "Binary replaced; agent will self-exec the new version."
 `
 	// 整个升级流程兜底超时 5 分钟 — 包括 GitHub 下载、二进制写入、SSE 流。
 	// 之前没设上限,sseStreamCmd 卡在 cmd.Wait + SSE 写之间能挂 2+ 天不释放 handler 协程
@@ -5724,6 +5724,20 @@ func scheduleSelfRespawn() {
 		return
 	}
 	log.Printf("[Manage] self-respawn: detached pid=%d will exec new binary in 2s", cmd.Process.Pid)
+}
+
+// exitForConfigReload exits after a config mutation. systemd, OpenRC with
+// supervise-daemon, runit and s6 will respawn the process themselves. Legacy
+// OpenRC services created with command_background (and direct/no-init installs)
+// have no supervisor, so arrange a detached self-respawn before exiting.
+func exitForConfigReload(reason string) {
+	if someoneWillRestartAgent() {
+		log.Printf("[Manage] Exiting for %s; external supervisor will restart agent", reason)
+	} else {
+		log.Printf("[Manage] No restart-capable supervisor detected for %s; scheduling self-respawn", reason)
+		scheduleSelfRespawn()
+	}
+	os.Exit(0)
 }
 
 func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *http.Request) {
@@ -5885,12 +5899,11 @@ func (h *ManageHandler) HandleSwitchXrayMode(w http.ResponseWriter, r *http.Requ
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	// 不用 exec systemctl restart(同进程 fork 偶发不释放/不退出导致一个 PID 占多个端口);
-	// 直接 os.Exit,systemd Restart=always 拉起新实例读新 xray_mode。
+	// 不直接执行 systemctl/rc-service restart(同进程 fork 可能继承 FD)。统一走
+	// supervisor 检测；没有可靠服务守护时由 agent 安排 self-respawn。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Exiting for xray_mode switch to %s (systemd will restart)", req.XrayMode)
-		os.Exit(0)
+		exitForConfigReload(fmt.Sprintf("xray_mode switch to %s", req.XrayMode))
 	}()
 }
 
@@ -5927,7 +5940,7 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 	// 历史上这里用 net.Listen 做"预检",但同进程内打开+关闭监听存在 Go runtime / 内核
 	// epoll 句柄残留的边界情况 — 一旦后续 systemctl 重启没成功(D-Bus / unit 名异常 / 静默 fail),
 	// 老 agent 进程就会保留两个 LISTEN(原端口 + 预检端口),反映到外面就是 "同 PID 占两个端口"。
-	// 改为"信任 + 重试":只校验数字范围,写 config,然后 os.Exit 让 systemd 拉起新实例;
+	// 改为"信任 + 重试":只校验数字范围,写 config,然后退出重载;
 	// 新实例 bind 失败由 main 里的 listenWithRetry 兜底(EADDRINUSE 重试 6 次每次 2s)。
 
 	data, err := os.ReadFile(h.configPath)
@@ -5970,11 +5983,11 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 	}
 	// 不用 exec.Command 跑 systemctl restart —— 同进程内 fork + 子进程继承 FD + systemctl 静默失败
 	// 这一串组合会导致老 agent 没死,新端口又被预检/重启循环里某个步骤额外绑上,出现"同 PID 两个 LISTEN"。
-	// 直接 os.Exit(0):systemd 的 Restart=always 会在 RestartSec 后拉起新实例,新实例读 config.yaml 的新端口绑定。
+	// 退出后由实际检测到的 supervisor 拉起；旧 OpenRC command_background
+	// 或无 init 环境会在退出前安排一次 self-respawn。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Exiting for listen_port switch to %d (systemd will restart)", req.ListenPort)
-		os.Exit(0)
+		exitForConfigReload(fmt.Sprintf("listen_port switch to %d", req.ListenPort))
 	}()
 }
 
