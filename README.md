@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.8 (2026-08-09)
+- 🌈 多用户凭据下发优化
+
 ### v0.4.7 (2026-08-06)
 - 🌈 支持更多信息上报
 
