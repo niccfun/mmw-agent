@@ -979,6 +979,7 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 			if cc := l.ConnCountSnapshot(); len(cc) > 0 {
 				payloadMap["conn_counts"] = cc
 			}
+			payloadMap["node_conn_counts"] = l.NodeConnCountSnapshot()
 		}
 
 		if monitor := c.embeddedXray.GetSpeedMonitor(); monitor != nil && !c.lastTrafficTime.IsZero() {
@@ -2081,11 +2082,12 @@ type WSLimiterConfigPayload struct {
 // WSUserLimitInfo 是单个用户的限速和连接数配置。
 // DeviceLimit 现语义 = 并发连接上限(0=不限);ConnGroup 为连接数计数分组键(同组共享配额)。
 type WSUserLimitInfo struct {
-	UID         int    `json:"uid"`
-	Email       string `json:"email"`
-	SpeedLimit  uint64 `json:"speed_limit"`
-	DeviceLimit int    `json:"device_limit"`
-	ConnGroup   string `json:"conn_group,omitempty"` // "<user>|<物理父节点ID>";空=退化按 email 计数(老主控兼容)
+	UID           int    `json:"uid"`
+	Email         string `json:"email"`
+	SpeedLimit    uint64 `json:"speed_limit"`
+	DeviceLimit   int    `json:"device_limit"`
+	ConnGroup     string `json:"conn_group,omitempty"` // "<user>|<物理父节点ID>";空=退化按 email 计数(老主控兼容)
+	ConnStatGroup string `json:"conn_stat_group,omitempty"`
 }
 
 // LicenseStatus 表示主控端下发的许可证状态。
@@ -2259,7 +2261,12 @@ func reloadNginxCmd() error {
 }
 
 func runCmd(name string, args ...string) error {
-	if output, err := exec.Command(name, args...).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if output, err := exec.CommandContext(ctx, name, args...).CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s timed out after 30s: %w", name, ctx.Err())
+		}
 		return fmt.Errorf("%s: %s: %w", name, string(output), err)
 	}
 	return nil
@@ -2307,11 +2314,12 @@ func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
 	users := make([]limiter.UserInfo, len(payload.Users))
 	for i, u := range payload.Users {
 		users[i] = limiter.UserInfo{
-			UID:         u.UID,
-			Email:       u.Email,
-			SpeedLimit:  u.SpeedLimit,
-			DeviceLimit: u.DeviceLimit,
-			ConnGroup:   u.ConnGroup,
+			UID:           u.UID,
+			Email:         u.Email,
+			SpeedLimit:    u.SpeedLimit,
+			DeviceLimit:   u.DeviceLimit,
+			ConnGroup:     u.ConnGroup,
+			ConnStatGroup: u.ConnStatGroup,
 		}
 	}
 

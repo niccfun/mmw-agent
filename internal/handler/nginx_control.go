@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -8,9 +9,24 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"mmw-agent/internal/constants"
 )
+
+const nginxCommandTimeout = 20 * time.Second
+
+func nginxCombinedOutput(name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), nginxCommandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+func nginxRun(name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), nginxCommandTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run()
+}
 
 type nginxRuntime struct {
 	Installed  bool   `json:"installed"`
@@ -69,7 +85,7 @@ func inspectNginxRuntime() nginxRuntime {
 	if bin == "" {
 		return rt
 	}
-	out, _ := exec.Command(bin, "-V").CombinedOutput()
+	out, _ := nginxCombinedOutput(bin, "-V")
 	flags := string(out)
 	value := func(name string) string {
 		re := regexp.MustCompile(`--` + regexp.QuoteMeta(name) + `=([^\s]+)`)
@@ -119,20 +135,20 @@ func nginxManagedServerDir() string {
 }
 
 func nginxIsActive() bool {
-	if commandExists("pgrep") && exec.Command("pgrep", "-x", "nginx").Run() == nil {
+	if commandExists("pgrep") && nginxRun("pgrep", "-x", "nginx") == nil {
 		return true
 	}
 	switch detectNginxManager() {
 	case "systemd":
-		return exec.Command("systemctl", "is-active", "--quiet", "nginx").Run() == nil
+		return nginxRun("systemctl", "is-active", "--quiet", "nginx") == nil
 	case "openrc":
-		return exec.Command("rc-service", "nginx", "status").Run() == nil
+		return nginxRun("rc-service", "nginx", "status") == nil
 	case "sysv":
-		return exec.Command("service", "nginx", "status").Run() == nil
+		return nginxRun("service", "nginx", "status") == nil
 	case "initd":
-		return exec.Command("/etc/init.d/nginx", "status").Run() == nil
+		return nginxRun("/etc/init.d/nginx", "status") == nil
 	case "supervisor":
-		out, err := exec.Command("supervisorctl", "status", "nginx").CombinedOutput()
+		out, err := nginxCombinedOutput("supervisorctl", "status", "nginx")
 		return err == nil && strings.Contains(string(out), "RUNNING")
 	default:
 		return false
@@ -140,25 +156,27 @@ func nginxIsActive() bool {
 }
 
 func runNginxServiceAction(action string) error {
-	var cmd *exec.Cmd
+	var name string
+	var args []string
 	switch detectNginxManager() {
 	case "systemd":
-		cmd = exec.Command("systemctl", action, "nginx")
+		name, args = "systemctl", []string{action, "nginx"}
 	case "openrc":
-		cmd = exec.Command("rc-service", "nginx", action)
+		name, args = "rc-service", []string{"nginx", action}
 	case "sysv":
-		cmd = exec.Command("service", "nginx", action)
+		name, args = "service", []string{"nginx", action}
 	case "initd":
-		cmd = exec.Command("/etc/init.d/nginx", action)
+		name, args = "/etc/init.d/nginx", []string{action}
 	case "supervisor":
-		cmd = exec.Command("supervisorctl", action, "nginx")
+		name, args = "supervisorctl", []string{action, "nginx"}
 	default:
 		return fmt.Errorf("no service manager")
 	}
-	log.Printf("[NginxManager] manager=%s action=%s command=%q", detectNginxManager(), action, strings.Join(cmd.Args, " "))
-	out, err := cmd.CombinedOutput()
+	command := strings.Join(append([]string{name}, args...), " ")
+	log.Printf("[NginxManager] manager=%s action=%s command=%q", detectNginxManager(), action, command)
+	out, err := nginxCombinedOutput(name, args...)
 	if err != nil {
-		return fmt.Errorf("%s: %s: %w", strings.Join(cmd.Args, " "), strings.TrimSpace(string(out)), err)
+		return fmt.Errorf("%s: %s: %w", command, strings.TrimSpace(string(out)), err)
 	}
 	return nil
 }
@@ -168,7 +186,7 @@ func nginxTest() error {
 	if bin == "" {
 		return fmt.Errorf("nginx not installed")
 	}
-	out, err := exec.Command(bin, "-t").CombinedOutput()
+	out, err := nginxCombinedOutput(bin, "-t")
 	if err != nil {
 		return fmt.Errorf("nginx -t: %s: %w", strings.TrimSpace(string(out)), err)
 	}
@@ -181,7 +199,7 @@ func nginxReload() error {
 	}
 	if bin := findNginxBinary(); bin != "" && nginxIsActive() {
 		log.Printf("[NginxManager] manager=command action=reload command=%q", bin+" -s reload")
-		if out, err := exec.Command(bin, "-s", "reload").CombinedOutput(); err == nil {
+		if out, err := nginxCombinedOutput(bin, "-s", "reload"); err == nil {
 			return nil
 		} else if serviceErr := runNginxServiceAction("reload"); serviceErr == nil {
 			return nil
@@ -206,7 +224,7 @@ func nginxStart() error {
 	if bin == "" {
 		return fmt.Errorf("nginx not installed")
 	}
-	out, err := exec.Command(bin).CombinedOutput()
+	out, err := nginxCombinedOutput(bin)
 	log.Printf("[NginxManager] manager=command action=start command=%q", bin)
 	if err != nil {
 		return fmt.Errorf("start nginx command: %s: %w", strings.TrimSpace(string(out)), err)

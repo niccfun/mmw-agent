@@ -147,15 +147,15 @@ func (d *Dispatcher) getLink(ctx context.Context) (*transport.Link, *transport.L
 	if user != nil && len(user.Email) > 0 {
 		// 连接数限制:按 group 精确并发计数、满额拒绝。在建出站前断流(零出站占用);
 		// 放行则注册 ctx 结束时 ReleaseConn 精确 -1。group="" 表示不限/不计数,无需释放。
-		if ok, group := d.Limiter.AcquireConn(sessionInbound.Tag, user.Email); !ok {
+		if ok, lease := d.Limiter.AcquireConn(sessionInbound.Tag, user.Email); !ok {
 			errors.LogWarning(ctx, "connection limit reached: ", user.Email)
 			common.Close(outboundLink.Writer)
 			common.Close(inboundLink.Writer)
 			common.Interrupt(outboundLink.Reader)
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, errors.New("connection limit reached: ", user.Email)
-		} else if group != "" {
-			untrack := d.Limiter.TrackConn(group, func() {
+		} else if lease.QuotaGroup != "" {
+			untrack := d.Limiter.TrackConn(lease.QuotaGroup, func() {
 				common.Close(outboundLink.Writer)
 				common.Close(inboundLink.Writer)
 				common.Interrupt(outboundLink.Reader)
@@ -163,7 +163,7 @@ func (d *Dispatcher) getLink(ctx context.Context) (*transport.Link, *transport.L
 			})
 			context.AfterFunc(ctx, func() {
 				untrack()
-				d.Limiter.ReleaseConn(group)
+				d.Limiter.ReleaseConn(lease)
 			})
 		}
 
@@ -324,19 +324,19 @@ func (d *Dispatcher) DispatchLink(ctx context.Context, destination net.Destinati
 		// 连接数限制:DispatchLink 是 VLESS 等的真实数据路径(不经 getLink),必须在这里也做满额拒绝,
 		// 否则限制形同虚设(历史 device_limit 同样只挂在 getLink,对 DispatchLink 路径无效)。
 		if si.User != nil && len(si.User.Email) > 0 {
-			if ok, group := d.Limiter.AcquireConn(si.Tag, si.User.Email); !ok {
+			if ok, lease := d.Limiter.AcquireConn(si.Tag, si.User.Email); !ok {
 				errors.LogWarning(ctx, "connection limit reached: ", si.User.Email)
 				common.Interrupt(outbound.Reader)
 				common.Close(outbound.Writer)
 				return errors.New("connection limit reached: ", si.User.Email)
-			} else if group != "" {
-				untrack := d.Limiter.TrackConn(group, func() {
+			} else if lease.QuotaGroup != "" {
+				untrack := d.Limiter.TrackConn(lease.QuotaGroup, func() {
 					common.Interrupt(outbound.Reader)
 					common.Close(outbound.Writer)
 				})
 				context.AfterFunc(ctx, func() {
 					untrack()
-					d.Limiter.ReleaseConn(group)
+					d.Limiter.ReleaseConn(lease)
 				})
 			}
 		}

@@ -3905,6 +3905,27 @@ func (h *ManageHandler) HandleBatchApply(w http.ResponseWriter, r *http.Request)
 	}
 	result.RoutingChanged = routingChanged
 
+	// A batch is one logical provisioning operation. Persisting the successful
+	// subset leaves package membership, parent-inbound clients and routed rule
+	// users out of sync. Reject the whole candidate before touching config.json
+	// when any item cannot be applied.
+	for _, itemResult := range result.InboundResults {
+		if strings.HasPrefix(itemResult, "err:") {
+			result.Success = false
+			result.Message = "batch rejected; current config unchanged"
+			writeJSON(w, http.StatusConflict, result)
+			return
+		}
+	}
+	for _, itemResult := range result.RoutingResults {
+		if strings.HasPrefix(itemResult, "err:") {
+			result.Success = false
+			result.Message = "batch rejected; current config unchanged"
+			writeJSON(w, http.StatusConflict, result)
+			return
+		}
+	}
+
 	if !inboundChanged && !routingChanged {
 		// 全是幂等 no-op,跳过写盘和重启
 		result.Success = true
@@ -3962,6 +3983,9 @@ func (h *ManageHandler) HandleBatchApply(w http.ResponseWriter, r *http.Request)
 			} else {
 				result.Message = "config persisted, xray restart failed (rollback also failed): " + err.Error()
 			}
+			result.Success = false
+			writeJSON(w, http.StatusInternalServerError, result)
+			return
 		} else {
 			result.RestartedXray = true
 		}

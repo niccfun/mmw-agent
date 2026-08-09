@@ -15,11 +15,15 @@ const (
 	PathChildXraySysCfg   = "/api/child/xray/system-config"
 	PathChildXrayCfgFiles = "/api/child/xray/config-files"
 	PathChildXrayTestCfg  = "/api/child/xray/test-config"
-	PathChildNginxInstall = "/api/child/nginx/install"
-	PathChildNginxRemove  = "/api/child/nginx/remove"
-	PathChildNginxConfig  = "/api/child/nginx/config"
-	PathChildNginxCfgFile = "/api/child/nginx/config-files"
-	PathChildSystemInfo   = "/api/child/system/info"
+	// PathChildXrayConfigTxn provides a durable prepare/activate/rollback
+	// protocol for whole-file Xray configuration changes. A prepared config is
+	// validated but does not affect the running process until activate.
+	PathChildXrayConfigTxn = "/api/child/xray/config-transaction"
+	PathChildNginxInstall  = "/api/child/nginx/install"
+	PathChildNginxRemove   = "/api/child/nginx/remove"
+	PathChildNginxConfig   = "/api/child/nginx/config"
+	PathChildNginxCfgFile  = "/api/child/nginx/config-files"
+	PathChildSystemInfo    = "/api/child/system/info"
 	// PathChildSystemNICs 列出本机启用中的网卡地址,供主控在配置 xray 出站 sendThrough
 	// (多 IP 机器指定从哪个源 IP 出站)时给用户选。旧版 agent 无此路由,主控据此降级为手填。
 	PathChildSystemNICs = "/api/child/system/nics"

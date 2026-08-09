@@ -1,6 +1,7 @@
 package xrayctl
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os/exec"
@@ -99,8 +100,13 @@ func findXrayBinary(pid int) string {
 }
 
 func runCmd(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s %v timed out after 30s: %w", name, args, ctx.Err())
+		}
 		return fmt.Errorf("%s %v: %s (%w)", name, args, string(out), err)
 	}
 	return nil
