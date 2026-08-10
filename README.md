@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.9 (2026-08-10)
+- 🌈 rc-service启动失败
+- 🌈 ws连接不稳定的适合反复重启
+
 ### v0.4.8 (2026-08-09)
 - 🌈 多用户凭据下发优化
 
