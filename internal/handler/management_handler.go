@@ -5875,7 +5875,7 @@ func (h *ManageHandler) HandleSwitchXrayMode(w http.ResponseWriter, r *http.Requ
 		lines = append(lines, "xray_mode: "+req.XrayMode)
 	}
 
-	if err := os.WriteFile(h.configPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+	if err := atomicWriteConfig(h.configPath, []byte(strings.Join(lines, "\n"))); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
 		return
 	}
@@ -5949,26 +5949,17 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	lines := strings.Split(string(data), "\n")
-	out := make([]string, 0, len(lines)+1)
-	found := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "listen_port:") {
-			if req.ListenPort > 0 {
-				out = append(out, fmt.Sprintf("listen_port: \"%d\"", req.ListenPort))
-				found = true
-			}
-			// req.ListenPort == 0 时直接丢弃这一行(恢复默认)
-			continue
-		}
-		out = append(out, line)
-	}
-	if !found && req.ListenPort > 0 {
-		out = append(out, fmt.Sprintf("listen_port: \"%d\"", req.ListenPort))
+	newData, changed := updateListenPortYAML(data, req.ListenPort)
+	if !changed {
+		log.Printf("[Manage] Config already has effective listen_port=%d; skipping restart", req.ListenPort)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Listen port is already effective",
+		})
+		return
 	}
 
-	if err := os.WriteFile(h.configPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
+	if err := atomicWriteConfig(h.configPath, newData); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
 		return
 	}
@@ -5989,6 +5980,82 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 		time.Sleep(500 * time.Millisecond)
 		exitForConfigReload(fmt.Sprintf("listen_port switch to %d", req.ListenPort))
 	}()
+}
+
+// updateListenPortYAML updates only listen_port and preserves every other line
+// verbatim. A requested port of 0 means the built-in default, represented by an
+// absent listen_port key. Returning changed=false is important: repeated master
+// reconciliation must not turn an already-effective default into a restart loop.
+func updateListenPortYAML(data []byte, requested int) ([]byte, bool) {
+	lines := strings.Split(string(data), "\n")
+	out := make([]string, 0, len(lines)+1)
+	found := false
+	changed := false
+	value := strconv.Itoa(requested)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "listen_port:") {
+			out = append(out, line)
+			continue
+		}
+
+		found = true
+		if requested == 0 {
+			changed = true
+			continue
+		}
+		current := strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "listen_port:")), "\"'")
+		if current == value {
+			out = append(out, line)
+		} else {
+			out = append(out, fmt.Sprintf("listen_port: \"%d\"", requested))
+			changed = true
+		}
+	}
+	if !found && requested > 0 {
+		out = append(out, fmt.Sprintf("listen_port: \"%d\"", requested))
+		changed = true
+	}
+	return []byte(strings.Join(out, "\n")), changed
+}
+
+// atomicWriteConfig prevents a restarting agent from observing a truncated
+// config (most critically an empty token/master_url) while it is being updated.
+func atomicWriteConfig(path string, data []byte) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config.yaml-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // HandleUpdateMasterURL 处理 POST /api/child/agent/update-master-url。
@@ -6103,7 +6170,7 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 		lines = append(lines, "master_url: "+req.MasterURL)
 	}
 
-	if err := os.WriteFile(h.configPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+	if err := atomicWriteConfig(h.configPath, []byte(strings.Join(lines, "\n"))); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
 		return
 	}
