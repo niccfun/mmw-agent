@@ -20,7 +20,7 @@ docker run -d \
   -v $(pwd)/xray-config:/usr/local/etc/xray \
   -v $(pwd)/nginx-cert:/etc/nginx/cert \
   -v $(pwd)/nginx-servers:/etc/nginx/servers \
-  ghcr.io/nuxproio/mmw-agent:latest
+ghcr.io/nuxproio/mmw-agent:latest
 ```
 
 或用 [docker-compose.yml](docker-compose.yml):
@@ -48,6 +48,26 @@ curl -sL https://raw.githubusercontent.com/nuxproio/mmw-agent/main/install.sh | 
 
 <details>
 <summary>更新日志</summary>
+
+### v0.4.9 (2026-08-10)
+- 🌈 rc-service启动失败
+- 🌈 ws连接不稳定的适合反复重启
+
+### v0.4.8 (2026-08-09)
+- 🌈 多用户凭据下发优化
+
+### v0.4.7 (2026-08-06)
+- 🌈 支持更多信息上报
+
+### v0.4.6 (2026-08-05)
+- 🌈 三网回程测试兜底traceroute
+
+### v0.4.5 (2026-08-04)
+- 🌈 支持探测三网回程
+- 🛠️ fix: nginx website 变量未转换
+
+### v0.4.4 (2026-08-02)
+- 🌈 主控交互自愈
 
 ### v0.4.3 (2026-07-31)
 - 🌈 增加cdn更新

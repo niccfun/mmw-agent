@@ -54,15 +54,22 @@ GEO_DIR="/usr/local/bin"
 for dat in geoip.dat geosite.dat; do
     if [ ! -f "$GEO_DIR/$dat" ]; then
         echo "[entrypoint] downloading $dat ..."
-        # GitHub 直链;墙内服务器可能慢但 agent 一般装在能访问 GitHub 的境外 VPS,可接受
-        wget -q -O "$GEO_DIR/$dat" \
-            "https://github.com/v2fly/domain-list-community/releases/latest/download/$dat" \
-            2>/dev/null || \
-        wget -q -O "$GEO_DIR/$dat" \
-            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$dat" \
-            2>/dev/null || {
+        tmp="$GEO_DIR/$dat.tmp"
+        downloaded=0
+        for url in \
+            "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/$dat" \
+            "https://gh-proxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$dat" \
+            "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$dat"; do
+            if wget -q -O "$tmp" "$url" 2>/dev/null && [ -s "$tmp" ]; then
+                mv -f "$tmp" "$GEO_DIR/$dat"
+                downloaded=1
+                break
+            fi
+            rm -f "$tmp"
+        done
+        if [ "$downloaded" != "1" ]; then
             echo "[entrypoint] WARN: $dat 下载失败,embedded xray 路由可能 panic"
-        }
+        fi
     fi
 done
 

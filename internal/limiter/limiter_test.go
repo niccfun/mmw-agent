@@ -71,6 +71,33 @@ func TestUpdateInboundLimiterZeroKeepsBucketForLiveThrottle(t *testing.T) {
 	}
 }
 
+func TestNodeConnectionStatsKeepRoutedNodesSeparate(t *testing.T) {
+	l := New()
+	l.AddInboundLimiter("route-stat-a", 0, []UserInfo{{
+		Email: "stat-user-a", DeviceLimit: 10,
+		ConnGroup: "stat-user|900", ConnStatGroup: "stat-user|901",
+	}})
+	l.AddInboundLimiter("route-stat-b", 0, []UserInfo{{
+		Email: "stat-user-b", DeviceLimit: 10,
+		ConnGroup: "stat-user|900", ConnStatGroup: "stat-user|902",
+	}})
+
+	okA, leaseA := l.AcquireConn("route-stat-a", "stat-user-a")
+	okB, leaseB := l.AcquireConn("route-stat-b", "stat-user-b")
+	if !okA || !okB {
+		t.Fatal("connections below the shared quota must be accepted")
+	}
+	if got := l.ConnCountSnapshot()["stat-user|900"]; got != 2 {
+		t.Fatalf("shared quota count = %d, want 2", got)
+	}
+	stats := l.NodeConnCountSnapshot()
+	if stats["stat-user|901"] != 1 || stats["stat-user|902"] != 1 {
+		t.Fatalf("actual-node counts = %#v, want one on each routed node", stats)
+	}
+	l.ReleaseConn(leaseA)
+	l.ReleaseConn(leaseB)
+}
+
 func bucketOf(l *Limiter, tag, email string) (*rate.Limiter, bool) {
 	v, ok := l.InboundInfo.Load(tag)
 	if !ok {

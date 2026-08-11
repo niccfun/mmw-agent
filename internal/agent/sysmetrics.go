@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"bufio"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -13,12 +15,19 @@ import (
 
 // ProbeSysMetrics 是一次采样结果,上报给主控(字段名与主控 remote_ws 解析对齐)。
 type ProbeSysMetrics struct {
-	CPUPct    float64 `json:"cpu_pct"`
-	LoadAvg   string  `json:"loadavg"`
-	MemUsed   int64   `json:"mem_used"`
-	MemTotal  int64   `json:"mem_total"`
-	DiskUsed  int64   `json:"disk_used"`
-	DiskTotal int64   `json:"disk_total"`
+	CPUPct     float64 `json:"cpu_pct"`
+	LoadAvg    string  `json:"loadavg"`
+	MemUsed    int64   `json:"mem_used"`
+	MemTotal   int64   `json:"mem_total"`
+	DiskUsed   int64   `json:"disk_used"`
+	DiskTotal  int64   `json:"disk_total"`
+	Uptime     int64   `json:"uptime,omitempty"`
+	CPUModel   string  `json:"cpu_model,omitempty"`
+	CPUCores   int     `json:"cpu_cores,omitempty"`
+	CPUThreads int     `json:"cpu_threads,omitempty"`
+	OS         string  `json:"os,omitempty"`
+	Kernel     string  `json:"kernel,omitempty"`
+	Arch       string  `json:"arch,omitempty"`
 	// 掩码:agent 只采开启项,主控据此决定填哪些字段(避免未采集的 0 值被当真实数据)。
 	HasCPU  bool `json:"has_cpu"`
 	HasMem  bool `json:"has_mem"`
@@ -35,9 +44,88 @@ type cpuTimes struct {
 type sysMetricsCollector struct {
 	lastCPU    cpuTimes
 	hasLastCPU bool
+	static     probeStaticSystemInfo
 }
 
-func newSysMetricsCollector() *sysMetricsCollector { return &sysMetricsCollector{} }
+type probeStaticSystemInfo struct {
+	CPUModel   string
+	CPUCores   int
+	CPUThreads int
+	OS         string
+	Kernel     string
+	Arch       string
+}
+
+func newSysMetricsCollector() *sysMetricsCollector {
+	return &sysMetricsCollector{static: readProbeStaticSystemInfo()}
+}
+
+func readProbeStaticSystemInfo() probeStaticSystemInfo {
+	info := probeStaticSystemInfo{CPUCores: runtime.NumCPU(), CPUThreads: runtime.NumCPU(), Arch: runtime.GOARCH}
+	if f, err := os.Open("/proc/cpuinfo"); err == nil {
+		scanner := bufio.NewScanner(f)
+		physicalCores := map[string]struct{}{}
+		physicalID, coreID := "0", ""
+		for scanner.Scan() {
+			parts := strings.SplitN(scanner.Text(), ":", 2)
+			if len(parts) == 2 {
+				key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+				if info.CPUModel == "" && (key == "model name" || key == "Hardware") {
+					info.CPUModel = value
+				}
+				if key == "physical id" {
+					physicalID = value
+				}
+				if key == "core id" {
+					coreID = value
+				}
+			} else if strings.TrimSpace(scanner.Text()) == "" && coreID != "" {
+				physicalCores[physicalID+":"+coreID] = struct{}{}
+				physicalID, coreID = "0", ""
+			}
+		}
+		if coreID != "" {
+			physicalCores[physicalID+":"+coreID] = struct{}{}
+		}
+		if len(physicalCores) > 0 {
+			info.CPUCores = len(physicalCores)
+		}
+		_ = f.Close()
+	}
+	if data, err := os.ReadFile("/etc/os-release"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "PRETTY_NAME=") {
+				info.OS = strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), "\"")
+				break
+			}
+		}
+	}
+	var uts unix.Utsname
+	if unix.Uname(&uts) == nil {
+		info.Kernel = charsToString(uts.Release[:])
+	}
+	return info
+}
+
+func charsToString(in []byte) string {
+	if i := strings.IndexByte(string(in), 0); i >= 0 {
+		return string(in[:i])
+	}
+	return string(in)
+}
+
+func readUptimeSeconds() int64 {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(fields[0], 64)
+	return int64(v)
+}
 
 // cpuPct 是纯函数:两次 /proc/stat 快照差分算 CPU 使用率百分比。
 // busy = Δtotal - Δidle; pct = busy/Δtotal*100。Δtotal<=0(异常/首次)返回 0。
@@ -147,7 +235,10 @@ func readLoadAvg() string {
 // sample 采集开启项。cpu/mem/disk 分别由开关控制,只采开启的,未开启项 HasX=false。
 // CPU% 需两次采样差分:首次调用(无基线)返回 HasCPU=true 但 CPUPct=0 并存基线,下次才有真实值。
 func (c *sysMetricsCollector) sample(cpu, mem, disk bool) ProbeSysMetrics {
-	var m ProbeSysMetrics
+	m := ProbeSysMetrics{
+		Uptime: readUptimeSeconds(), CPUModel: c.static.CPUModel, CPUCores: c.static.CPUCores, CPUThreads: c.static.CPUThreads,
+		OS: c.static.OS, Kernel: c.static.Kernel, Arch: c.static.Arch,
+	}
 	if cpu {
 		if cur, ok := readCPUTimes(); ok {
 			if c.hasLastCPU {

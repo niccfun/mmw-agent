@@ -51,11 +51,10 @@ fi
 # 3. 下载到临时位置(--max-time 防止网络卡死无限等)
 # 镜像链 — GitHub 优先,失败再自动降级到 CDN 代理。纯 v6 机器直连 github 会"network is unreachable"
 # (release binary 重定向到无 AAAA 的 objects.githubusercontent.com),会快速失败后降级到
-# ghproxy/gh-proxy(v4+v6 双栈反代)。
+# gh-proxy 反代兜底。
 MIRRORS=(
     "https://github.com/${REPO}/${PATH_SUFFIX}"
     "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
-    "https://mirror.ghproxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
 )
 TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
 trap 'rm -f "$TMP" "$TMP.sig"' EXIT
@@ -75,7 +74,7 @@ for URL in "${MIRRORS[@]}"; do
     fi
     log "  → 该镜像失败,尝试下一个..."
 done
-[ "$download_ok" = "1" ] || err "所有镜像均下载失败(GitHub + ghproxy + gh-proxy 全部不可达)"
+[ "$download_ok" = "1" ] || err "所有镜像均下载失败(GitHub + gh-proxy 全部不可达)"
 SIZE=$(du -h "$TMP" | cut -f1)
 NEW_MD5=$(md5sum "$TMP" | awk '{print $1}')
 log "下载完成: $SIZE, md5=$NEW_MD5"

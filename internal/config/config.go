@@ -121,11 +121,12 @@ func Load(path string) (*Config, error) {
 // 从环境变量构造配置（不含默认值，用于 Merge）。
 func fromEnvRaw() *Config {
 	config := &Config{
-		MasterURL:      os.Getenv("MMWX_MASTER_URL"),
-		Token:          firstNonEmpty(os.Getenv("MMWX_MASTER_TOKEN"), os.Getenv("MMWX_TOKEN")),
-		ConnectionMode: os.Getenv("MMWX_CONNECTION_MODE"),
-		ListenPort:     os.Getenv("MMWX_LISTEN_PORT"),
-		XrayMode:       os.Getenv("MMWX_XRAY_MODE"),
+		MasterURL:       os.Getenv("MMWX_MASTER_URL"),
+		RecoveryURL:     os.Getenv("MMWX_RECOVERY_URL"),
+		Token:           firstNonEmpty(os.Getenv("MMWX_MASTER_TOKEN"), os.Getenv("MMWX_TOKEN")),
+		ConnectionMode:  os.Getenv("MMWX_CONNECTION_MODE"),
+		ListenPort:      os.Getenv("MMWX_LISTEN_PORT"),
+		XrayMode:        os.Getenv("MMWX_XRAY_MODE"),
 		RestartMethod:   os.Getenv("MMWX_RESTART_METHOD"),
 		RestartCommand:  os.Getenv("MMWX_RESTART_COMMAND"),
 		MasterPublicKey: os.Getenv("MMWX_MASTER_PUBLIC_KEY"),

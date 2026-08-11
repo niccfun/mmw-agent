@@ -48,3 +48,5 @@ sign-local.sh
 # 本地 agent 升级签名私钥(切勿提交)
 .agent-update-private-key.b64
 *.private-key*
+!internal/handler/nginx_websites_test.go
+!internal/handler/xray_config_transaction_test.go

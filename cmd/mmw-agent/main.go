@@ -319,6 +319,19 @@ func main() {
 
 	// 嵌入模式：启动内嵌 Xray 实例
 	var embeddedXray *embedded.EmbeddedXray
+	// 安装脚本之外再做一次启动保护。主控本机已经通过 HTTPS 提供服务时，
+	// tunnel/fallback 会让 Xray 抢占 443，导致主控立即失联。即使用户复用了旧
+	// 安装命令或手工改过配置，也在启动 Xray 前降级为非偷自己模式。
+	if (cfg.StealMode == "tunnel" || cfg.StealMode == "fallback") &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(cfg.MasterURL)), "https://") {
+		_, etcMMWXErr := os.Stat("/etc/mmwx")
+		_, varMMWXErr := os.Stat("/var/lib/mmwx")
+		if etcMMWXErr == nil || varMMWXErr == nil {
+			log.Printf("[Main] WARNING: HTTPS master detected on this host; disabling steal-self to protect port 443")
+			cfg.StealMode = ""
+			protectMasterHTTPSPort443(constants.DefaultXrayConfigPaths[0])
+		}
+	}
 	if cfg.XrayMode == "embedded" {
 		// embedded 模式统一使用 mmwx 标准路径(constants.DefaultXrayConfigPaths[0],
 		// 通常是 /usr/local/etc/xray/config.json),不管以前外置 xray 装在哪。
@@ -415,6 +428,8 @@ func main() {
 
 	// 创建 agent 客户端
 	agentClient := agent.NewClient(cfg)
+	manageHandler.OnMasterURLChanged(agentClient.ApplyMasterURL)
+	manageHandler.OnProbeMasterURL(agentClient.ProbeMasterURL)
 	if embeddedXray != nil {
 		agentClient.SetEmbeddedXray(embeddedXray)
 	}
@@ -663,10 +678,11 @@ func (g *listenGate) stop() {
 // 背景:GitHub Release 重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
 // 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直接 connect: network is unreachable → geoip.dat
 //
-// jsdelivr 全球 CDN 同时提供 v4/v6;ghproxy 同款。GitHub 原始保留兜底(国内有 v4 时可达)。
+// jsdelivr 全球 CDN 同时提供 v4/v6;gh-proxy 作为国内回退。
+// GitHub 原始保留兜底(国内有 v4 时可达)。
 var geoMirrorTemplates = []string{
 	"https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/%s",
-	"https://mirror.ghproxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
+	"https://gh-proxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
 	"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
 }
 
@@ -916,11 +932,81 @@ func initXrayConfig(path string, stealMode string) {
 	}
 }
 
+// protectMasterHTTPSPort443 removes only Xray objects that can seize the
+// master's HTTPS port. The original file is retained as a recovery backup;
+// unrelated inbounds/outbounds remain available.
+func protectMasterHTTPSPort443(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) <= 4 {
+		return
+	}
+	var cfg map[string]any
+	if json.Unmarshal(data, &cfg) != nil {
+		return
+	}
+	removedTags := map[string]bool{}
+	filter := func(raw any, remove func(map[string]any) bool) []any {
+		items, _ := raw.([]any)
+		out := make([]any, 0, len(items))
+		for _, item := range items {
+			obj, _ := item.(map[string]any)
+			if obj != nil && remove(obj) {
+				if tag, _ := obj["tag"].(string); tag != "" {
+					removedTags[tag] = true
+				}
+				continue
+			}
+			out = append(out, item)
+		}
+		return out
+	}
+	cfg["inbounds"] = filter(cfg["inbounds"], func(obj map[string]any) bool {
+		port, _ := obj["port"].(float64)
+		return port == 443
+	})
+	cfg["outbounds"] = filter(cfg["outbounds"], func(obj map[string]any) bool {
+		tag, _ := obj["tag"].(string)
+		return tag == "nginx"
+	})
+	if routing, _ := cfg["routing"].(map[string]any); routing != nil {
+		routing["rules"] = filter(routing["rules"], func(obj map[string]any) bool {
+			if outbound, _ := obj["outboundTag"].(string); outbound == "nginx" {
+				return true
+			}
+			for _, rawTag := range toAnySlice(obj["inboundTag"]) {
+				if tag, _ := rawTag.(string); removedTags[tag] {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return
+	}
+	backup := path + ".before-master-https-protect"
+	_ = os.WriteFile(backup, data, 0600)
+	if err := os.WriteFile(path, out, 0644); err != nil {
+		log.Printf("[Main] Failed to protect HTTPS master port 443: %v", err)
+		return
+	}
+	log.Printf("[Main] Removed Xray port 443 entry to protect HTTPS master (backup: %s)", backup)
+}
+
+func toAnySlice(value any) []any {
+	if items, ok := value.([]any); ok {
+		return items
+	}
+	return nil
+}
+
 // patchTunnelForwardUDPFullcone 启动自愈:扫描 xray config,给端口转发补齐 UDP + full-cone。
 //   - 转发入站(protocol tunnel / dokodemo-door,排除基础设施 api / tunnel-in):settings.network 缺 udp 就补成 "tcp,udp"。
 //     (api 是 gRPC 命令通道、tunnel-in 是 reality 443 的 TLS 入站,都只能 tcp,跳过。)
 //   - 转发出站(protocol freedom,tag 以 "tunnel-" 开头):domainStrategy 若为 UseIP* 则改 AsIs。
 //     UseIP 会按包重解析目标 → UDP 退化成对称 NAT;AsIs 不重解析,保住 full-cone。
+//
 // 仅在有改动时写回,避免每次启动无谓写盘。
 func patchTunnelForwardUDPFullcone(path string) {
 	data, err := os.ReadFile(path)

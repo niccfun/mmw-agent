@@ -46,7 +46,19 @@ var KickCounter sync.Map // map[string]*int64
 // connCount 每个 group 的**当前并发连接数**(group = "<user>|<物理父节点ID>",由主控下发)。
 // 一个用户在同一物理节点(含其路由出站子账户)的所有 email 共享同一 group → 共享一份连接配额。
 // AcquireConn 进连接 +1、ReleaseConn 出连接 -1;精确并发(靠 dispatcher 的 ctx AfterFunc 释放)。
-var connCount sync.Map // map[string]*atomic.Int64
+var connCount sync.Map     // map[string]*atomic.Int64
+var nodeConnCount sync.Map // map[实际节点统计 group]*atomic.Int64
+
+// activeConnKickers 保存每个连接组当前存量连接的中断函数。主控禁用用户、用户
+// 超额或套餐过期后会把该 group 从 limiter 配置中移除；SyncInboundLimiter 检测到
+// group 消失时立即中断这些连接，而不是只阻止下一次认证、等待长连接自然结束。
+type connKickerSet struct {
+	mu   sync.Mutex
+	next uint64
+	all  map[uint64]func()
+}
+
+var activeConnKickers sync.Map // map[group]*connKickerSet
 
 func connCounter(group string) *atomic.Int64 {
 	if v, ok := connCount.Load(group); ok {
@@ -54,6 +66,67 @@ func connCounter(group string) *atomic.Int64 {
 	}
 	v, _ := connCount.LoadOrStore(group, new(atomic.Int64))
 	return v.(*atomic.Int64)
+}
+
+func nodeConnCounter(group string) *atomic.Int64 {
+	if v, ok := nodeConnCount.Load(group); ok {
+		return v.(*atomic.Int64)
+	}
+	v, _ := nodeConnCount.LoadOrStore(group, new(atomic.Int64))
+	return v.(*atomic.Int64)
+}
+
+type ConnLease struct {
+	QuotaGroup string
+	StatGroup  string
+}
+
+// TrackConn 注册一条已放行连接的中断函数，返回的 cleanup 必须在连接结束时调用。
+func (l *Limiter) TrackConn(group string, kick func()) func() {
+	if group == "" || kick == nil {
+		return func() {}
+	}
+	value, _ := activeConnKickers.LoadOrStore(group, &connKickerSet{all: make(map[uint64]func())})
+	set := value.(*connKickerSet)
+	set.mu.Lock()
+	set.next++
+	id := set.next
+	set.all[id] = kick
+	set.mu.Unlock()
+	return func() {
+		set.mu.Lock()
+		delete(set.all, id)
+		empty := len(set.all) == 0
+		set.mu.Unlock()
+		if empty {
+			activeConnKickers.CompareAndDelete(group, set)
+		}
+	}
+}
+
+func kickConnGroup(group string) {
+	value, ok := activeConnKickers.LoadAndDelete(group)
+	if !ok {
+		return
+	}
+	set := value.(*connKickerSet)
+	set.mu.Lock()
+	kickers := make([]func(), 0, len(set.all))
+	for _, kick := range set.all {
+		kickers = append(kickers, kick)
+	}
+	set.all = make(map[uint64]func())
+	set.mu.Unlock()
+	for _, kick := range kickers {
+		kick()
+	}
+}
+
+func userConnGroup(u UserInfo) string {
+	if u.ConnGroup != "" {
+		return u.ConnGroup
+	}
+	return u.Email
 }
 
 // lookupUserInfo 按 (tag,email) 前缀扫描找到该用户的限流配置。
@@ -84,12 +157,12 @@ func (l *Limiter) lookupUserInfo(tag, email string) (UserInfo, bool) {
 //
 // connLimit<=0(不限)时仍计数(供用户视图展示当前连接数),但永不拒绝。
 // group 为空(老主控未下发 ConnGroup)时退化按 email 计数,行为仍正确(只是不跨 email 共享)。
-func (l *Limiter) AcquireConn(tag, email string) (ok bool, group string) {
+func (l *Limiter) AcquireConn(tag, email string) (ok bool, lease ConnLease) {
 	u, found := l.lookupUserInfo(tag, email)
 	if !found {
-		return true, "" // 无该用户限流记录(如未下发)→ 放行不计数
+		return true, ConnLease{} // 无该用户限流记录(如未下发)→ 放行不计数
 	}
-	group = u.ConnGroup
+	group := u.ConnGroup
 	if group == "" {
 		group = email
 	}
@@ -99,19 +172,30 @@ func (l *Limiter) AcquireConn(tag, email string) (ok bool, group string) {
 	if connLimit > 0 && n > int64(connLimit) {
 		c.Add(-1) // 撤销本次占用
 		incrementKickCounter(email)
-		return false, ""
+		return false, ConnLease{}
 	}
-	return true, group
+	statGroup := u.ConnStatGroup
+	if statGroup == "" {
+		statGroup = group
+	}
+	nodeConnCounter(statGroup).Add(1)
+	return true, ConnLease{QuotaGroup: group, StatGroup: statGroup}
 }
 
 // ReleaseConn 在连接结束时调用,把 group 的并发连接数 -1(下限 0)。
-func (l *Limiter) ReleaseConn(group string) {
-	if group == "" {
+func (l *Limiter) ReleaseConn(lease ConnLease) {
+	if lease.QuotaGroup == "" {
 		return
 	}
-	c := connCounter(group)
+	c := connCounter(lease.QuotaGroup)
 	if c.Add(-1) < 0 {
 		c.Store(0)
+	}
+	if lease.StatGroup != "" {
+		c = nodeConnCounter(lease.StatGroup)
+		if c.Add(-1) < 0 {
+			c.Store(0)
+		}
 	}
 }
 
@@ -119,6 +203,17 @@ func (l *Limiter) ReleaseConn(group string) {
 func (l *Limiter) ConnCountSnapshot() map[string]int64 {
 	out := make(map[string]int64)
 	connCount.Range(func(k, v interface{}) bool {
+		if n := v.(*atomic.Int64).Load(); n > 0 {
+			out[k.(string)] = n
+		}
+		return true
+	})
+	return out
+}
+
+func (l *Limiter) NodeConnCountSnapshot() map[string]int64 {
+	out := make(map[string]int64)
+	nodeConnCount.Range(func(k, v interface{}) bool {
 		if n := v.(*atomic.Int64).Load(); n > 0 {
 			out[k.(string)] = n
 		}
@@ -175,6 +270,18 @@ func (l *Limiter) SyncInboundLimiter(tag string, nodeSpeedLimit uint64, users []
 		return
 	}
 	prev := old.(*InboundInfo)
+	nextGroups := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		nextGroups[userConnGroup(u)] = struct{}{}
+	}
+	removedGroups := make(map[string]struct{})
+	prev.UserInfo.Range(func(_, value any) bool {
+		group := userConnGroup(value.(UserInfo))
+		if _, retained := nextGroups[group]; !retained {
+			removedGroups[group] = struct{}{}
+		}
+		return true
+	})
 
 	// 仍然整体换 InboundInfo 而不是原地改 NodeSpeedLimit:后者会与 GetUserBucket
 	// 的无锁读构成数据竞争。换指针由 sync.Map.Store 保证可见性。
@@ -189,6 +296,9 @@ func (l *Limiter) SyncInboundLimiter(tag string, nodeSpeedLimit uint64, users []
 		info.UserInfo.Store(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID), u)
 	}
 	l.InboundInfo.Store(tag, info)
+	for group := range removedGroups {
+		kickConnGroup(group)
+	}
 
 	// 把新速率写进存量桶,存量连接立刻感知。
 	// limit==0(无限制)不动:同 UpdateInboundLimiter 的说明 —— 删桶或原地置无限
