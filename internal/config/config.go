@@ -55,6 +55,7 @@ func (b *FlexBool) Bool(def bool) bool {
 // Config 保存 agent 的运行配置。
 type Config struct {
 	MasterURL             string        `yaml:"master_url"`
+	RecoveryURL           string        `yaml:"recovery_url"`
 	Token                 string        `yaml:"token"`
 	ConnectionMode        string        `yaml:"connection_mode"`
 	ListenPort            string        `yaml:"listen_port"`
@@ -175,6 +176,9 @@ func (c *Config) MergeEnv() {
 func (c *Config) Merge(env *Config) {
 	if env.MasterURL != "" {
 		c.MasterURL = env.MasterURL
+	}
+	if env.RecoveryURL != "" {
+		c.RecoveryURL = env.RecoveryURL
 	}
 	if env.Token != "" {
 		c.Token = env.Token
