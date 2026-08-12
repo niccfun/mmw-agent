@@ -5750,20 +5750,109 @@ func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *htt
 		return
 	}
 	log.Printf("[Manage] Starting Agent uninstall (stream)...")
-	script := `
+	cmd := exec.CommandContext(r.Context(), "bash", "-c", agentUninstallScheduleScript)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Agent uninstall scheduled")
+}
+
+// agentUninstallScheduleScript deliberately runs the destructive part outside
+// the agent service's cgroup. Running `systemctl stop mmw-agent` from a child of
+// mmw-agent.service lets systemd kill the shell together with the agent before
+// it can disable the unit or remove the binary. Restart=always then brings the
+// agent straight back, which looks like an unkillable process.
+//
+// Keep legacy service/binary names here: early releases used agent-mmwx and
+// mmwx-agent, and those supervisors can otherwise resurrect a newer agent.
+const agentUninstallScheduleScript = `
 set -e
 echo "=========================================="
 echo "  MMW-Agent Uninstall"
 echo "=========================================="
 
-echo "Scheduling delayed uninstall..."
-nohup bash -c 'sleep 2 && systemctl stop mmw-agent && systemctl disable mmw-agent && rm -f /usr/local/bin/mmw-agent && rm -f /etc/systemd/system/mmw-agent.service && systemctl daemon-reload && rm -rf /etc/mmw-agent /var/lib/mmw-agent && echo "Agent uninstalled"' >/dev/null 2>&1 &
-echo "Agent will be uninstalled in a few seconds."
+HELPER="/tmp/mmw-agent-uninstall-$$.sh"
+cat > "$HELPER" <<'MMWX_UNINSTALL'
+#!/bin/sh
+set +e
+sleep 2
+LOG=/tmp/mmw-agent-uninstall.log
+exec >>"$LOG" 2>&1
+echo "$(date -Iseconds 2>/dev/null || date) uninstall started"
+
+SERVICES="mmw-agent agent-mmwx mmwx-agent"
+
+# Remove boot/respawn entry points before stopping anything. Removing binaries
+# also makes a racing Restart=always/supervise-daemon respawn harmless.
+if command -v systemctl >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        systemctl disable "$service.service" >/dev/null 2>&1 || true
+    done
+fi
+if command -v rc-update >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        rc-update del "$service" default >/dev/null 2>&1 || rc-update del "$service" >/dev/null 2>&1 || true
+    done
+fi
+if [ -f /etc/rc.local ]; then
+    sed -i '/mmw-agent-supervisor\.sh/d;/\/usr\/local\/bin\/mmw-agent[[:space:]]/d;/\/usr\/local\/bin\/agent-mmwx[[:space:]]/d;/\/usr\/local\/bin\/mmwx-agent[[:space:]]/d' /etc/rc.local 2>/dev/null || true
+fi
+
+rm -f /usr/local/bin/mmw-agent /usr/local/bin/agent-mmwx /usr/local/bin/mmwx-agent
+rm -f /usr/local/bin/mmw-agent-supervisor.sh
+
+# Stop every known service manager. This helper is a separate systemd unit (or
+# a setsid process), so stopping mmw-agent.service cannot terminate it midway.
+if command -v systemctl >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        systemctl stop "$service.service" >/dev/null 2>&1 || true
+    done
+fi
+if command -v rc-service >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        rc-service "$service" stop >/dev/null 2>&1 || true
+    done
+fi
+
+pkill -TERM -f '/usr/local/bin/mmw-agent-supervisor\.sh' >/dev/null 2>&1 || true
+pkill -TERM -x mmw-agent >/dev/null 2>&1 || true
+pkill -TERM -x agent-mmwx >/dev/null 2>&1 || true
+pkill -TERM -x mmwx-agent >/dev/null 2>&1 || true
+sleep 2
+pkill -KILL -x mmw-agent >/dev/null 2>&1 || true
+pkill -KILL -x agent-mmwx >/dev/null 2>&1 || true
+pkill -KILL -x mmwx-agent >/dev/null 2>&1 || true
+
+rm -f /etc/systemd/system/mmw-agent.service /etc/systemd/system/agent-mmwx.service /etc/systemd/system/mmwx-agent.service
+rm -f /usr/lib/systemd/system/mmw-agent.service /usr/lib/systemd/system/agent-mmwx.service /usr/lib/systemd/system/mmwx-agent.service
+rm -f /etc/init.d/mmw-agent /etc/init.d/agent-mmwx /etc/init.d/mmwx-agent
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed mmw-agent.service agent-mmwx.service mmwx-agent.service >/dev/null 2>&1 || true
+fi
+
+rm -rf /etc/mmw-agent /var/lib/mmw-agent /etc/agent-mmwx /var/lib/agent-mmwx
+echo "$(date -Iseconds 2>/dev/null || date) Agent uninstalled"
+rm -f "$0"
+MMWX_UNINSTALL
+chmod 700 "$HELPER"
+
+echo "Scheduling detached uninstall..."
+if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    # A transient service gets its own cgroup and survives stopping the agent.
+    if systemd-run --quiet --no-block --collect \
+        --unit="mmw-agent-uninstall-$$" \
+        --property=Type=oneshot /bin/sh "$HELPER"; then
+        echo "Detached uninstall unit created."
+        exit 0
+    fi
+    echo "systemd-run unavailable on this system; falling back to setsid."
+fi
+if command -v setsid >/dev/null 2>&1; then
+    nohup setsid /bin/sh "$HELPER" >/dev/null 2>&1 </dev/null &
+else
+    nohup /bin/sh "$HELPER" >/dev/null 2>&1 </dev/null &
+fi
+echo "Agent uninstall accepted; cleanup will start in 2 seconds."
 `
-	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
-	cmd.Env = os.Environ()
-	sseStreamCmd(w, r, cmd, "Agent uninstall scheduled")
-}
 
 // HandleLimiter 处理 POST /api/child/limiter，用于直接配置嵌入式 Xray 的限速。
 func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
