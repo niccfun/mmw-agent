@@ -45,6 +45,8 @@ type ManageHandler struct {
 	embeddedXray        *embedded.EmbeddedXray
 	embeddedMu          sync.Mutex
 	onEmbeddedXrayStart func(*embedded.EmbeddedXray)
+	onMasterURLChanged  func(string)
+	probeMasterURL      func(context.Context, string) (time.Duration, error)
 	// inboundsMu 串行化所有 manageInbound 操作(包括新的 add-client/remove-client),
 	// 防止主控并发绑多个用户时:1) 配置文件 read-modify-write 撕裂;
 	// 2) 主控旧 GET→remove+add 路径下相互覆盖丢 client。
@@ -55,6 +57,12 @@ type ManageHandler struct {
 	// xrayAccessLogPath 是内嵌 xray 的 access log 文件(见 config.XrayAccessLogPathFor)。
 	// 内嵌模式下 service=xray 读它,而不是查 journalctl -u xray(那个 unit 不存在)。
 	xrayAccessLogPath string
+}
+
+func (h *ManageHandler) OnMasterURLChanged(fn func(string)) { h.onMasterURLChanged = fn }
+
+func (h *ManageHandler) OnProbeMasterURL(fn func(context.Context, string) (time.Duration, error)) {
+	h.probeMasterURL = fn
 }
 
 // SetLogPath 注入 agent 自身日志文件路径,供 HandleGetLogs 读取。
@@ -5837,6 +5845,39 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 	}()
 }
 
+// HandleProbeMasterURL handles POST /api/child/agent/probe-master-url.
+func (h *ManageHandler) HandleProbeMasterURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		MasterURL string `json:"master_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !util.IsHTTPURL(strings.TrimSpace(req.MasterURL)) {
+		writeError(w, http.StatusBadRequest, "master_url must be a valid HTTP(S) URL")
+		return
+	}
+	if h.probeMasterURL == nil {
+		writeError(w, http.StatusServiceUnavailable, "master probe is not ready")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	latency, err := h.probeMasterURL(ctx, strings.TrimRight(strings.TrimSpace(req.MasterURL), "/"))
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": false, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "latency_ms": latency.Milliseconds()})
+}
+
 // HandleUpdateMasterURL 处理 POST /api/child/agent/update-master-url。
 // 更新 config.yaml 中的 master_url 并重启 agent。
 func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Request) {
@@ -5907,18 +5948,18 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("master_url updated to %s, agent restarting...", req.MasterURL),
+		"message": fmt.Sprintf("master_url updated to %s", req.MasterURL),
 	})
 
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+	// Delay until the response has left the current connection, then reconnect
+	// in-process. This also works in containers without an init system.
+	if h.onMasterURLChanged != nil {
+		newURL := req.MasterURL
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			h.onMasterURLChanged(newURL)
+		}()
 	}
-	// 不用 exec systemctl restart;直接 os.Exit,systemd Restart=always 拉起新实例。
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Exiting for master_url update (systemd will restart)")
-		os.Exit(0)
-	}()
 }
 
 func sameMasterURL(a, b string) bool {
