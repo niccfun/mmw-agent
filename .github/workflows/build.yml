@@ -171,9 +171,11 @@ jobs:
           GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
         run: |
           test -n "$AGENT_UPDATE_PRIVATE_KEY" || { echo "::error::AGENT_UPDATE_PRIVATE_KEY is required"; exit 1; }
-          go run ./tools/sign \
-            package/mmw-agent-linux-amd64 package/mmw-agent-linux-arm64 \
-            package/mmw-agent-darwin-amd64 package/mmw-agent-darwin-arm64
+          cd tools/sign
+          go run . \
+            ../../package/mmw-agent-linux-amd64 ../../package/mmw-agent-linux-arm64 \
+            ../../package/mmw-agent-darwin-amd64 ../../package/mmw-agent-darwin-arm64
+          cd ../..
           GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://dl.miaomiaowux.com/mmwx-guard}"
           for arch in amd64 arm64; do
             for suffix in "" ".sig"; do
