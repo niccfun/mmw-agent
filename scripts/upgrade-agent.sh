@@ -58,9 +58,9 @@ MIRRORS=(
     "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
 )
 GUARD_MIRRORS=(
+    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
     "https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
     "https://gh-proxy.com/https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
-    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
     "https://license.miaomiaowux.com/downloads/mmwx-guardd-linux-${ARCH_NAME}"
 )
 TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
@@ -123,11 +123,13 @@ for URL in "${GUARD_MIRRORS[@]}"; do
     log "下载 Agent Guard $URL ..."
     if command -v curl >/dev/null 2>&1; then
         if curl -fsSL --connect-timeout 10 --max-time 180 -o "$GUARD_TMP" "$URL" && \
-           curl -fsSL --connect-timeout 10 --max-time 60 -o "$GUARD_TMP.sig" "${URL}.sig"; then
+           curl -fsSL --connect-timeout 10 --max-time 60 -o "$GUARD_TMP.sig" "${URL}.sig" && \
+           "$BIN" __verify-update "$GUARD_TMP" "$GUARD_TMP.sig"; then
             guard_download_ok=1; break
         fi
     elif wget -q --connect-timeout=10 --read-timeout=180 -O "$GUARD_TMP" "$URL" && \
-         wget -q --connect-timeout=10 --read-timeout=60 -O "$GUARD_TMP.sig" "${URL}.sig"; then
+         wget -q --connect-timeout=10 --read-timeout=60 -O "$GUARD_TMP.sig" "${URL}.sig" && \
+         "$BIN" __verify-update "$GUARD_TMP" "$GUARD_TMP.sig"; then
         guard_download_ok=1; break
     fi
 done

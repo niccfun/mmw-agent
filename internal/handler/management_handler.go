@@ -5629,9 +5629,9 @@ MIRRORS=(
     "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 )
 GUARD_MIRRORS=(
+    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
     "https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
     "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
-    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
     "https://license.miaomiaowux.com/downloads/mmwx-guardd-linux-${ARCH_NAME}"
 )
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
@@ -5679,9 +5679,11 @@ if [ "$download_ok" != "1" ]; then
 fi
 
 guard_download_ok=0
+SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
 for url in "${GUARD_MIRRORS[@]}"; do
     echo "Downloading Agent Guard from $url ..."
-    if dl "$url" /tmp/mmwx-guardd-new && dl "${url}.sig" /tmp/mmwx-guardd-new.sig; then
+    if dl "$url" /tmp/mmwx-guardd-new && dl "${url}.sig" /tmp/mmwx-guardd-new.sig && \
+       "$SELF_BIN" __verify-update /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig; then
         guard_download_ok=1
         break
     fi
@@ -5698,7 +5700,6 @@ echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
 
 # 签名校验:用【当前正在运行】的 agent 内嵌公钥校验新二进制,通过才替换。
 # 私钥离线(GitHub secret / 本地未提交脚本),主控与本仓库都没有 → 主控被攻破也签不出能过校验的二进制。
-SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
 echo "Verifying signature ..."
 if ! "$SELF_BIN" __verify-update /tmp/mmw-agent-new /tmp/mmw-agent-new.sig; then
     echo "ERROR: 升级二进制签名校验失败,已拒绝替换" >&2

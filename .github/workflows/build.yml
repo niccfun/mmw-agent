@@ -169,7 +169,7 @@ jobs:
         env:
           GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
         run: |
-          GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://license.miaomiaowux.com/downloads}"
+          GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://dl.miaomiaowux.com/mmwx-guard}"
           for arch in amd64 arm64; do
             for suffix in "" ".sig"; do
               name="mmwx-guardd-linux-${arch}${suffix}"

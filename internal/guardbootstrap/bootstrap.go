@@ -108,11 +108,8 @@ func Ensure(ctx context.Context, cfg Config) error {
 	binTmp := filepath.Join(tmpDir, name)
 	sigTmp := binTmp + ".sig"
 	manifestTmp := filepath.Join(tmpDir, "agent.manifest")
-	if err := downloadSignedPair(ctx, cfg.HTTPClient, cfg.DownloadBases, name, binTmp, sigTmp); err != nil {
+	if err := downloadSignedPair(ctx, cfg.HTTPClient, cfg.DownloadBases, name, binTmp, sigTmp, cfg.Verify); err != nil {
 		return err
-	}
-	if err := cfg.Verify(binTmp, sigTmp); err != nil {
-		return fmt.Errorf("verify Agent Guard update: %w", err)
 	}
 	if err := downloadFromBases(ctx, cfg.HTTPClient, cfg.DownloadBases, "mmw-agent-linux-"+runtime.GOARCH+".manifest", manifestTmp, 64<<10); err != nil {
 		return fmt.Errorf("download signed Agent release manifest: %w", err)
@@ -229,9 +226,9 @@ func defaultDownloadBases() []string {
 		values = append(values, strings.TrimRight(licenseServer, "/")+"/downloads")
 	}
 	values = append(values,
+		"https://dl.miaomiaowux.com/mmwx-guard",
 		"https://github.com/iluobei/mmw-agent/releases/latest/download",
 		"https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download",
-		"https://dl.miaomiaowux.com/mmwx-guard",
 		"https://license.miaomiaowux.com/downloads",
 	)
 	seen := make(map[string]struct{}, len(values))
@@ -250,7 +247,7 @@ func defaultDownloadBases() []string {
 	return result
 }
 
-func downloadSignedPair(ctx context.Context, client *http.Client, bases []string, name, binPath, sigPath string) error {
+func downloadSignedPair(ctx context.Context, client *http.Client, bases []string, name, binPath, sigPath string, verify func(string, string) error) error {
 	var lastErr error
 	for _, base := range bases {
 		if err := downloadFile(ctx, client, strings.TrimRight(base, "/")+"/"+name, binPath, 128<<20); err != nil {
@@ -259,6 +256,10 @@ func downloadSignedPair(ctx context.Context, client *http.Client, bases []string
 		}
 		if err := downloadFile(ctx, client, strings.TrimRight(base, "/")+"/"+name+".sig", sigPath, 4096); err != nil {
 			lastErr = err
+			continue
+		}
+		if err := verify(binPath, sigPath); err != nil {
+			lastErr = fmt.Errorf("verify Guard from %s: %w", base, err)
 			continue
 		}
 		return nil
