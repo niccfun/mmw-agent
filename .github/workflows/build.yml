@@ -177,14 +177,14 @@ jobs:
             ../../package/mmw-agent-darwin-amd64 ../../package/mmw-agent-darwin-arm64
           cd ../..
           GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://dl.miaomiaowux.com/mmwx-guard}"
+          chmod +x package/mmw-agent-linux-amd64
           for arch in amd64 arm64; do
             for suffix in "" ".sig"; do
               name="mmwx-guardd-linux-${arch}${suffix}"
               curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
                 "${GUARD_ASSET_BASE%/}/$name" -o "package/$name"
             done
-            chmod +x "package/mmw-agent-linux-${arch}"
-            "package/mmw-agent-linux-${arch}" __verify-update \
+            package/mmw-agent-linux-amd64 __verify-update \
               "package/mmwx-guardd-linux-${arch}" "package/mmwx-guardd-linux-${arch}.sig"
           done
           cd package
