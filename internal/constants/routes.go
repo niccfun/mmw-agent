@@ -59,6 +59,8 @@ const (
 	PathChildUpdateMasterURL  = "/api/child/agent/update-master-url"
 	PathChildProbeMasterURL   = "/api/child/agent/probe-master-url"
 	PathChildTakeoverXray     = "/api/child/external-xray/takeover"
+	PathChildGuardAttest      = "/api/child/action-guard/attest"
+	PathChildGuardConsume     = "/api/child/action-guard/consume"
 	// PathChildBatchApply 一次性提交多个 inbound add-client + routing rule add_user 改动,
 	// 在 inboundsMu 锁内单次读 config + 单次写盘 + per-inbound runtime apply 完成。
 	// 用于套餐绑用户场景:同台 server 上多个 routed 节点的所有改动合并成 1 次 round-trip。

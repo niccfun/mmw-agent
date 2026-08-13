@@ -73,5 +73,26 @@ for dat in geoip.dat geosite.dat; do
     fi
 done
 
+# Agent Guard 持有独立设备身份并通过 Unix Socket 提供短期证明。进程退出时
+# 终止 Agent，让容器整体重启，避免以“半鉴权”状态继续接受管理写操作。
+mkdir -p /run/mmwx-guard-agent /var/lib/mmwx-guard
+/usr/local/bin/mmwx-guardd \
+    --role agent \
+    --socket "${MMWX_GUARD_SOCKET:-/run/mmwx-guard-agent/guard.sock}" \
+    --state-dir /var/lib/mmwx-guard \
+    --manifest /usr/local/share/mmwx-guard/agent.manifest &
+GUARD_PID=$!
+for _ in $(seq 1 30); do
+    [ -S "${MMWX_GUARD_SOCKET:-/run/mmwx-guard-agent/guard.sock}" ] && break
+    kill -0 "$GUARD_PID" 2>/dev/null || { echo "ERROR: MMWX Agent Guard exited during startup" >&2; exit 1; }
+    sleep 1
+done
+[ -S "${MMWX_GUARD_SOCKET:-/run/mmwx-guard-agent/guard.sock}" ] || { echo "ERROR: Agent Guard socket was not created" >&2; exit 1; }
+(
+    while kill -0 "$GUARD_PID" 2>/dev/null; do sleep 2; done
+    echo "ERROR: MMWX Agent Guard stopped; terminating Agent" >&2
+    kill -TERM "$$" 2>/dev/null || true
+) &
+
 # 启动 agent
 exec "$@"

@@ -30,7 +30,10 @@ import (
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
+	"mmw-agent/internal/guardbootstrap"
+	"mmw-agent/internal/guardclient"
 	"mmw-agent/internal/handler"
+	"mmw-agent/internal/licenselease"
 	"mmw-agent/internal/securechan"
 	"mmw-agent/internal/selfupdate"
 	"mmw-agent/internal/util"
@@ -208,6 +211,38 @@ func main() {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "__guard-health" {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: mmw-agent __guard-health <unix-socket>")
+			os.Exit(2)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		health, err := guardclient.NewForSocket(guardclient.ModeRequired, os.Args[2]).Health(ctx)
+		if err != nil || !health.OK || health.Role != "agent" || !health.CallerVerified {
+			fmt.Fprintln(os.Stderr, "Agent Guard health check failed:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Compatibility bridge for hosts upgraded by an older Agent: that updater
+	// only replaced mmw-agent and could not install the newly split Guard. Do
+	// this before configuration and Xray startup so an official release never
+	// enters a partially authorized state. Docker images already bundle Guard.
+	if licenselease.Required() && !util.IsDocker() {
+		bootstrapCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+		if err := guardbootstrap.EnsureDefault(bootstrapCtx); err != nil {
+			cancel()
+			log.Fatalf("[Main] 无法安装或启动 Agent Guard: %v", err)
+		}
+		cancel()
+		// The first process after upgrading a legacy unit has not yet inherited
+		// the newly written systemd drop-in. Enable Guard in this process too;
+		// subsequent restarts receive the same values from systemd.
+		_ = os.Setenv("MMWX_ACTION_GUARD", "required")
+		_ = os.Setenv("MMWX_GUARD_SOCKET", "/run/mmwx-guard-agent/guard.sock")
+	}
 
 	configPath := flag.String("config", "", "Path to config file")
 	configPathShort := flag.String("c", "", "Path to config file (shorthand)")
@@ -272,6 +307,8 @@ func main() {
 	manageHandler.SetLogPath(cfg.LogPath) // 供「Agent 日志」页读取 agent 自身日志文件
 	manageHandler.SetXrayMode(cfg.XrayMode)
 	manageHandler.SetXrayAccessLogPath(xrayAccessLog) // 内嵌模式 service=xray 读它
+	agentGuard := guardclient.NewFromEnv()
+	manageHandler.SetActionGuard(agentGuard)
 
 	// WARP 服务 — 状态文件 warp.json 跟 config.yaml 同目录(空 cfgFile 时用当前工作目录)
 	warpWorkDir := "."
@@ -280,6 +317,19 @@ func main() {
 	}
 	warpService := warp.NewService(warpWorkDir)
 	warpHandler := handler.NewWarpHandler(cfg.Token, warpService, manageHandler)
+	leaseManager, leaseErr := licenselease.New(
+		filepath.Join(warpWorkDir, "agent_identity.key"),
+		filepath.Join(warpWorkDir, "agent_license.json"),
+		cfg.Token,
+		agentGuard,
+	)
+	if leaseErr != nil {
+		if licenselease.Required() {
+			log.Fatalf("[Main] 无法初始化 Agent 许可证身份: %v", leaseErr)
+		}
+		log.Printf("[Main] WARN: Agent 许可证身份不可用: %v", leaseErr)
+	}
+	manageHandler.SetLeaseManager(leaseManager)
 
 	// geoip.dat / geosite.dat 不分 mode 都要准备好 — 主控的 xray test-config 在 external mode
 	// 下若 LookPath("xray") 失败(典型: xray 还在 install 流程中)会 fallback 走 xray-core 库
@@ -291,9 +341,9 @@ func main() {
 		go ensureGeoData()
 	}
 
-	// 许可证配额授权:主控上次判定本机是否在服务器配额内。超额时主控下发 xray_authorized=0 并由 agent 落盘,
-	// 重启时据此决定是否拉起 xray(「重启立即检查」)。nil/未配置 = 首次或默认 → 授权先跑;
-	// 连上主控后由 handleConfigUpdate 的 xray_authorized 分支校正到最新值。
+	// Xray 的上次授权由主控通过已认证的控制通道下发并落盘。短期 Agent
+	// 租约只保护 Premium 能力和防克隆审计，绝不能把许可证服务的短暂失联、
+	// 证书故障或协议灰度失败放大成所有服务器同时停止 Xray。
 	xrayAuthorized := cfg.XrayAuthorized.Bool(true)
 	if !xrayAuthorized {
 		log.Printf("[Main] 许可证配额:本机上次被主控判定为超额(xray_authorized=0),启动时不拉起 xray,等待主控重新授权")
@@ -383,9 +433,11 @@ func main() {
 	// 外部模式：启动时自动检测并补全 xray 配置
 	if embeddedXray == nil && !xrayAuthorized {
 		// 超额未授权(external 模式,或 embedded 未授权跳过启动):停掉 xray,等待主控重新授权。
-		// tunnel 模式下 StopXray 会先让 nginx 接管 443。
+		// tunnel 模式下 StopXray 会先停 Xray 释放 443，再让 nginx 接管。
 		log.Printf("[Main] 许可证配额未授权,停止 xray 服务")
-		manageHandler.StopXray()
+		if err := manageHandler.StopXray(); err != nil {
+			log.Printf("[Main] 停止未授权 xray 失败: %v", err)
+		}
 	} else if embeddedXray == nil {
 		log.Printf("[Main] Running startup xray auto-detection...")
 		result := manageHandler.EnsureXrayConfig()
@@ -410,6 +462,9 @@ func main() {
 
 	// 创建 agent 客户端
 	agentClient := agent.NewClient(cfg)
+	if leaseManager != nil {
+		agentClient.SetLeaseManager(leaseManager)
+	}
 	manageHandler.OnMasterURLChanged(agentClient.ApplyMasterURL)
 	manageHandler.OnProbeMasterURL(agentClient.ProbeMasterURL)
 	if embeddedXray != nil {
@@ -422,17 +477,23 @@ func main() {
 	})
 	// 注入许可证配额授权回调:主控下发 xray_authorized 变化时,授权→启 xray、超额→停 xray。
 	// 复用 ManageHandler 的 StopXray/StartXray(含 embedded/external + tunnel 模式 nginx 443 让路)。
-	agentClient.SetXrayAuthHandler(func(authorized bool) {
+	applyXrayAuthorization := func(authorized bool) {
 		if authorized {
-			log.Printf("[Main] 许可证配额:已授权,启动 xray")
+			log.Printf("[Main] 主控服务器配额已授权,启动 xray")
 			if err := manageHandler.StartXray(); err != nil {
-				log.Printf("[Main] 许可证配额授权后启动 xray 失败: %v", err)
+				log.Printf("[Main] 主控配额授权后启动 xray 失败: %v", err)
 			}
 		} else {
-			log.Printf("[Main] 许可证配额:超额,停止 xray")
-			manageHandler.StopXray()
+			log.Printf("[Main] 主控判定本机超出服务器配额,停止 xray")
+			if err := manageHandler.StopXray(); err != nil {
+				log.Printf("[Main] 主控配额授权撤销后停止 xray 失败: %v", err)
+			}
 		}
-	})
+	}
+	agentClient.SetXrayAuthHandler(applyXrayAuthorization)
+	// Agent lease transitions deliberately do not call applyXrayAuthorization.
+	// They gate Premium operations in Client.HasProFeature; the data plane keeps
+	// its last explicitly applied state during license-service incidents.
 	// lazyStartEmbeddedXray 可能在回调注册前已经执行（EnsureXrayConfig 触发），补偿传递
 	if ex := manageHandler.GetEmbeddedXray(); ex != nil && embeddedXray == nil {
 		log.Printf("[Main] Propagating lazy-started embedded Xray to agent client")
@@ -472,7 +533,10 @@ func main() {
 
 	// 创建 HTTP 服务（不设置 WriteTimeout，避免影响 SSE 长连接）
 	server := &http.Server{
-		Addr:        ":" + cfg.ListenPort,
+		// Agent management is outbound-WS first. Bind loopback only so the
+		// management API is never exposed to the public network; the same mux is
+		// still reachable by the master through authenticated WS/RPC.
+		Addr:        "127.0.0.1:" + cfg.ListenPort,
 		Handler:     handler.SilentAuthMiddleware(cfg.Token, pullHandler),
 		ReadTimeout: constants.DefaultReadTimeout,
 	}
@@ -480,6 +544,9 @@ func main() {
 	// 配置优雅退出
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if leaseManager != nil {
+		leaseManager.Start(ctx)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -502,7 +569,9 @@ func main() {
 		if newPort, ok := resolveListenPortConflict(cfg.ListenPort); ok {
 			log.Printf("[Main] Original port %s stuck after 12s retry; switching to %d and persisting", cfg.ListenPort, newPort)
 			cfg.ListenPort = fmt.Sprintf("%d", newPort)
-			server.Addr = ":" + cfg.ListenPort
+			// 换端口也必须保持 loopback-only；否则一次端口冲突会把原本仅经
+			// WS/RPC 使用的管理接口意外暴露到公网。
+			server.Addr = "127.0.0.1:" + cfg.ListenPort
 			if err := persistListenPort(cfgFile, cfg.ListenPort); err != nil {
 				log.Printf("[Main] Warn: failed to persist new listen_port to %s: %v (next restart will re-detect)", cfgFile, err)
 			}
@@ -512,7 +581,7 @@ func main() {
 			log.Fatalf("[Main] HTTP server bind failed on :%s: %v", cfg.ListenPort, err)
 		}
 	}
-	log.Printf("[Main] HTTP server listening on :%s", cfg.ListenPort)
+	log.Printf("[Main] local management API listening on 127.0.0.1:%s", cfg.ListenPort)
 	// gate 接管 Serve;初始保持监听(默认行为)。开启端口隐身后,WS 连上会(延迟)关闭监听、
 	// WS 断开立即重开。
 	gate := newListenGate(server, httpLn)
@@ -521,7 +590,7 @@ func main() {
 	// 入站端口仅 WS 不可用时的 HTTP/pull 回退需要。钩子在 Start 之前注入,避免 WS 抢先连上时漏挂。
 	if cfg.HidePortOnWS.Bool(false) {
 		agentClient.SetListenGateHooks(gate.onWSConnected, gate.onWSDisconnected)
-		log.Printf("[Main] WS-stealth enabled: inbound :%s closes while WebSocket is connected", cfg.ListenPort)
+		log.Printf("[Main] WS-stealth enabled: loopback listener :%s closes while WebSocket is connected", cfg.ListenPort)
 	}
 
 	// 启动 agent 客户端(在监听 + 钩子就绪之后)
@@ -566,7 +635,7 @@ const listenCloseGrace = 5 * time.Second
 type listenGate struct {
 	mu      sync.Mutex
 	server  *http.Server
-	addr    string       // 监听地址,如 ":23889"(已含 boot 阶段冲突切换后的最终端口)
+	addr    string       // 监听地址,如 "127.0.0.1:23889"(已含 boot 阶段冲突切换后的最终端口)
 	ln      net.Listener // 当前监听;nil 表示已关闭
 	timer   *time.Timer  // 待执行的延迟关闭
 	stopped bool         // 进程退出中,忽略后续开关
@@ -785,7 +854,7 @@ func resolveListenPortConflict(currentPort string) (int, bool) {
 		return 0, false
 	}
 	// 先快速试一下当前端口
-	if ln, err := net.Listen("tcp", fmt.Sprintf(":%d", want)); err == nil {
+	if ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(want))); err == nil {
 		ln.Close()
 		return want, false
 	}
@@ -795,7 +864,7 @@ func resolveListenPortConflict(currentPort string) (int, bool) {
 		if candidate > 65535 {
 			break
 		}
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", candidate))
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(candidate)))
 		if err != nil {
 			continue
 		}

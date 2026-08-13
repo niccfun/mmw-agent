@@ -51,6 +51,25 @@ jobs:
             exit 1
           fi
 
+      - name: Download signed Agent Guard assets
+        env:
+          GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
+        run: |
+          GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://license.miaomiaowux.com/downloads}"
+          mkdir -p guard-dist
+          for arch in amd64 arm64; do
+            for suffix in "" ".sig"; do
+              name="mmwx-guardd-linux-${arch}${suffix}"
+              curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+                "${GUARD_ASSET_BASE%/}/$name" -o "guard-dist/$name"
+            done
+          done
+          test "$(wc -c < guard-dist/mmwx-guardd-linux-amd64.sig)" -eq 64
+          test "$(wc -c < guard-dist/mmwx-guardd-linux-arm64.sig)" -eq 64
+          chmod +x dist/mmw-agent-linux-amd64
+          dist/mmw-agent-linux-amd64 __verify-update guard-dist/mmwx-guardd-linux-amd64 guard-dist/mmwx-guardd-linux-amd64.sig
+          dist/mmw-agent-linux-amd64 __verify-update guard-dist/mmwx-guardd-linux-arm64 guard-dist/mmwx-guardd-linux-arm64.sig
+
       - name: Generate version.json
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,6 +104,13 @@ jobs:
               --endpoint-url "$R2_ENDPOINT" \
               --content-type application/octet-stream \
               --cache-control "public, max-age=86400"
+          done
+          for f in guard-dist/mmwx-guardd-linux-*; do
+            name=$(basename "$f")
+            aws s3 cp "$f" "s3://$BUCKET/mmwx-guard/$name" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --content-type application/octet-stream \
+              --cache-control "public, max-age=300"
           done
           aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/version.json" \
             --endpoint-url "$R2_ENDPOINT" \

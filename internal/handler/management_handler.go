@@ -23,6 +23,8 @@ import (
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
+	"mmw-agent/internal/guardclient"
+	"mmw-agent/internal/licenselease"
 	"mmw-agent/internal/limiter"
 	"mmw-agent/internal/util"
 	"mmw-agent/internal/version"
@@ -38,13 +40,18 @@ var nginxInstalling atomic.Bool
 
 // ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
-	configToken         string
-	configPath          string
-	restartMethod       string
-	restartCommand      string
-	xrayMode            string
-	embeddedXray        *embedded.EmbeddedXray
-	embeddedMu          sync.Mutex
+	configToken    string
+	configPath     string
+	restartMethod  string
+	restartCommand string
+	xrayMode       string
+	embeddedXray   *embedded.EmbeddedXray
+	embeddedMu     sync.Mutex
+	// xrayControlMu serializes license-driven and manually requested start/stop
+	// transitions. In tunnel mode both operations also mutate nginx's 443
+	// fallback, so overlapping transitions could otherwise leave nginx and
+	// Xray competing for the same listener.
+	xrayControlMu       sync.Mutex
 	onEmbeddedXrayStart func(*embedded.EmbeddedXray)
 	onMasterURLChanged  func(string)
 	probeMasterURL      func(context.Context, string) (time.Duration, error)
@@ -58,6 +65,8 @@ type ManageHandler struct {
 	// xrayAccessLogPath 是内嵌 xray 的 access log 文件(见 config.XrayAccessLogPathFor)。
 	// 内嵌模式下 service=xray 读它,而不是查 journalctl -u xray(那个 unit 不存在)。
 	xrayAccessLogPath string
+	actionGuard       *guardclient.Client
+	leaseManager      *licenselease.Manager
 }
 
 func (h *ManageHandler) OnMasterURLChanged(fn func(string)) { h.onMasterURLChanged = fn }
@@ -70,6 +79,9 @@ func (h *ManageHandler) SetLogPath(p string) { h.logPath = p }
 
 // SetXrayAccessLogPath 注入内嵌 xray 的 access log 文件路径。
 func (h *ManageHandler) SetXrayAccessLogPath(p string) { h.xrayAccessLogPath = p }
+
+func (h *ManageHandler) SetActionGuard(client *guardclient.Client)     { h.actionGuard = client }
+func (h *ManageHandler) SetLeaseManager(manager *licenselease.Manager) { h.leaseManager = manager }
 
 // 创建管理处理器。
 func NewManageHandler(configToken, restartMethod, restartCommand string) *ManageHandler {
@@ -107,6 +119,12 @@ func (h *ManageHandler) GetEmbeddedXray() *embedded.EmbeddedXray {
 
 // RestartXray 使用配置的重启方式重启 xray。
 func (h *ManageHandler) RestartXray() error {
+	h.xrayControlMu.Lock()
+	defer h.xrayControlMu.Unlock()
+	return h.restartXrayUnlocked()
+}
+
+func (h *ManageHandler) restartXrayUnlocked() error {
 	if h.xrayMode == "embedded" {
 		h.embeddedMu.Lock()
 		defer h.embeddedMu.Unlock()
@@ -118,34 +136,80 @@ func (h *ManageHandler) RestartXray() error {
 	return xrayctl.RestartXray(h.restartMethod, h.restartCommand)
 }
 
-// StopXray 停止 xray:tunnel 模式先恢复 nginx 443 fallback 再停,让 nginx 接管 443。
+// StopXray 停止 xray。tunnel 模式必须先停 Xray 释放 443，再让 nginx
+// fallback 接管。反过来会让 nginx reload 在 Xray 仍占用 443 时失败，
+// 并把无法启动的 xray_fallback_443.conf 遗留在磁盘上。
 // 与 HandleServiceControl 的 stop 分支同源逻辑,供许可证配额授权回调(超额停机)复用。
-func (h *ManageHandler) StopXray() {
-	if h.configNeedsPort443() {
-		h.deployFallback443()
-		h.reloadNginx()
+func (h *ManageHandler) StopXray() error {
+	h.xrayControlMu.Lock()
+	defer h.xrayControlMu.Unlock()
+
+	stop := h.stopXrayRuntime
+	if !h.configNeedsPort443() {
+		return stop()
 	}
-	if h.embeddedXray != nil {
-		h.embeddedXray.Stop()
-	} else {
-		exec.Command("systemctl", "stop", "xray").Run()
-	}
+	return transitionXrayToFallback(stop, h.deployFallback443, h.reloadNginx)
 }
 
 // StartXray 启动 xray:tunnel 模式先移除 nginx 443 fallback 释放端口再启,失败则回滚 fallback。
 // 与 HandleServiceControl 的 start 分支同源逻辑,供许可证配额授权回调(拿到名额启机)复用。
 func (h *ManageHandler) StartXray() error {
+	h.xrayControlMu.Lock()
+	defer h.xrayControlMu.Unlock()
+
 	if h.configNeedsPort443() {
 		h.removeFallback443()
-		h.reloadNginx()
+		if err := h.reloadNginx(); err != nil {
+			return fmt.Errorf("release nginx port 443: %w", err)
+		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	if err := h.RestartXray(); err != nil {
+	if err := h.restartXrayUnlocked(); err != nil {
 		if h.configNeedsPort443() {
 			h.deployFallback443()
 			h.reloadNginx()
 		}
 		return err
+	}
+	return nil
+}
+
+func (h *ManageHandler) stopXrayRuntime() error {
+	if h.embeddedXray != nil {
+		if err := h.embeddedXray.Stop(); err != nil {
+			return fmt.Errorf("stop embedded xray: %w", err)
+		}
+		return nil
+	}
+	// A stopped embedded instance is represented by nil. Do not fall through to
+	// systemctl in containers or after a repeated authorization update.
+	if h.xrayMode == "embedded" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "systemctl", "stop", "xray").CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("stop external xray timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("stop external xray: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
+// transitionXrayToFallback keeps the safety-critical order explicit and
+// testable. A failed stop must never publish a listener that competes with the
+// still-running Xray process.
+func transitionXrayToFallback(stop, deploy, reload func() error) error {
+	if err := stop(); err != nil {
+		return err
+	}
+	if err := deploy(); err != nil {
+		return fmt.Errorf("deploy nginx 443 fallback: %w", err)
+	}
+	if err := reload(); err != nil {
+		return fmt.Errorf("activate nginx 443 fallback: %w", err)
 	}
 	return nil
 }
@@ -209,14 +273,18 @@ func (h *ManageHandler) fallback443Path() string {
 	return filepath.Join(constants.NginxPrimaryPrefixDir, "stream_servers", "xray_fallback_443.conf")
 }
 
-func (h *ManageHandler) deployFallback443() {
+func (h *ManageHandler) deployFallback443() error {
 	path := h.fallback443Path()
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	if err := os.WriteFile(path, []byte(fallback443Conf), 0644); err != nil {
 		log.Printf("[Manage] Failed to deploy fallback_443: %v", err)
+		return err
 	} else {
 		log.Printf("[Manage] Deployed fallback_443 stream config")
 	}
+	return nil
 }
 
 func (h *ManageHandler) removeFallback443() {
@@ -228,10 +296,12 @@ func (h *ManageHandler) removeFallback443() {
 	}
 }
 
-func (h *ManageHandler) reloadNginx() {
+func (h *ManageHandler) reloadNginx() error {
 	if err := nginxReload(); err != nil {
 		log.Printf("[NginxManager] reload failed: %v", err)
+		return err
 	}
+	return nil
 }
 
 // lazyStartEmbeddedXray 在 embedded 模式下延迟初始化 xray 实例。
@@ -553,11 +623,8 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	} else if req.Service == "xray" && req.Action == "stop" {
-		// tunnel 模式：停止前恢复 nginx stream fallback，让 nginx 直接接管 443
-		if h.configNeedsPort443() {
-			h.deployFallback443()
-			h.reloadNginx()
-		}
+		// 先回应请求，再执行停机，避免当管理链路本身经过 Xray 时丢失响应。
+		// StopXray 内部保证 tunnel 模式下“先停 Xray，再启 nginx fallback”。
 		log.Printf("[Manage] Service xray: stop (deferred)")
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
@@ -568,26 +635,13 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 		}
 		go func() {
 			time.Sleep(500 * time.Millisecond)
-			if h.embeddedXray != nil {
-				h.embeddedXray.Stop()
-			} else {
-				exec.Command("systemctl", "stop", "xray").Run()
+			if err := h.StopXray(); err != nil {
+				log.Printf("[Manage] Deferred xray stop failed: %v", err)
 			}
 		}()
 		return
 	} else if req.Service == "xray" && req.Action == "start" {
-		// tunnel 模式：启动前移除 nginx stream fallback，释放 443 端口
-		if h.configNeedsPort443() {
-			h.removeFallback443()
-			h.reloadNginx()
-			time.Sleep(300 * time.Millisecond)
-		}
-		if err := h.RestartXray(); err != nil {
-			// 启动失败，恢复 fallback
-			if h.configNeedsPort443() {
-				h.deployFallback443()
-				h.reloadNginx()
-			}
+		if err := h.StartXray(); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("启动 xray 失败: %v %s", err, serviceFailureDetail("xray")))
 			return
 		}
@@ -5518,9 +5572,22 @@ func (h *ManageHandler) HandleAgentUpgradeStream(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
+	if h.actionGuard == nil || !h.actionGuard.Required() {
+		writeError(w, http.StatusConflict, "Agent Guard 未启用，拒绝执行非原子升级")
+		return
+	}
+	guardCtx, guardCancel := context.WithTimeout(r.Context(), 5*time.Second)
+	guardHealth, guardErr := h.actionGuard.Health(guardCtx)
+	guardCancel()
+	if guardErr != nil || !guardHealth.OK || guardHealth.Role != "agent" || !guardHealth.CallerVerified {
+		writeError(w, http.StatusConflict, "Agent Guard 未就绪，请等待兼容引导完成或重新安装 Agent")
+		return
+	}
 	log.Printf("[Manage] Starting Agent upgrade (stream)...")
 	// 升级流程:
-	//   1. 脚本里只做"下载 + 校验 + 替换二进制",不再嵌入 `systemctl restart`
+	//   1. 同时下载并校验 Agent + Agent Guard,先更新并确认 Guard 健康,再替换 Agent。
+	//      Guard 的 /var/lib/mmwx-guard 身份与租约目录不动,失败会回滚 Guard 且不碰 Agent。
+	//   2. 脚本里不重启 Agent 本身,避免 systemd 在 agent 所属 cgroup 中杀掉升级脚本。
 	//      (旧实现把 systemctl restart 放在 nohup bash 里,bash 在 mmw-agent.service 的 cgroup,
 	//       systemd 杀 cgroup 时把 bash 也杀掉,/tmp 文件不会清理,且偶发不重启 — 见 port/xray_mode 切换
 	//       同款问题的修复)
@@ -5539,6 +5606,20 @@ case $ARCH in
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
+cleanup_upgrade_files() {
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig /tmp/mmw-agent-new.manifest
+}
+trap cleanup_upgrade_files EXIT
+
+if [ "${DOCKER:-0}" = "1" ] || [ -f /.dockerenv ]; then
+    echo "ERROR: Docker Agent 必须更新容器镜像，不能在容器内替换 Agent/Guard" >&2
+    exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+    echo "ERROR: Agent Guard 联合升级当前要求 systemd；请重新运行 Agent 安装命令" >&2
+    exit 1
+fi
+
 # 镜像链 — 顺序尝试,任一成功即停。GitHub 优先,失败再自动降级到 CDN 代理。
 # 注:GitHub Release binary 实际重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
 # 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 会快速失败(近乎即时,
@@ -5546,6 +5627,12 @@ esac
 MIRRORS=(
     "https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
     "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+)
+GUARD_MIRRORS=(
+    "https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
+    "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
+    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
+    "https://license.miaomiaowux.com/downloads/mmwx-guardd-linux-${ARCH_NAME}"
 )
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -5591,6 +5678,21 @@ if [ "$download_ok" != "1" ]; then
     exit 1
 fi
 
+guard_download_ok=0
+for url in "${GUARD_MIRRORS[@]}"; do
+    echo "Downloading Agent Guard from $url ..."
+    if dl "$url" /tmp/mmwx-guardd-new && dl "${url}.sig" /tmp/mmwx-guardd-new.sig; then
+        guard_download_ok=1
+        break
+    fi
+    echo "  → 该 Guard 镜像失败(二进制或签名缺失),尝试下一个..."
+done
+if [ "$guard_download_ok" != "1" ]; then
+    echo "ERROR: Agent Guard 或签名下载失败；现有 Agent/Guard 均未改动" >&2
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig
+    exit 1
+fi
+
 chmod +x /tmp/mmw-agent-new
 echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
 
@@ -5600,20 +5702,123 @@ SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
 echo "Verifying signature ..."
 if ! "$SELF_BIN" __verify-update /tmp/mmw-agent-new /tmp/mmw-agent-new.sig; then
     echo "ERROR: 升级二进制签名校验失败,已拒绝替换" >&2
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig
     exit 1
 fi
 echo "Signature OK."
+
+echo "Verifying Agent Guard signature ..."
+if ! "$SELF_BIN" __verify-update /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig; then
+    echo "ERROR: Agent Guard 签名校验失败，现有 Agent/Guard 均未改动" >&2
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig
+    exit 1
+fi
+echo "Agent Guard signature OK."
+
+manifest_download_ok=0
+for url in "${MIRRORS[@]}"; do
+    if dl "${url}.manifest" /tmp/mmw-agent-new.manifest; then manifest_download_ok=1; break; fi
+done
+if [ "$manifest_download_ok" != "1" ]; then
+    echo "ERROR: Agent 发布签名清单下载失败，现有 Agent/Guard 均未改动" >&2
+    exit 1
+fi
+
+# 安装/升级 Guard 服务。只替换二进制和 unit，不删除 /var/lib/mmwx-guard，
+# 因而设备 Ed25519 身份和当前许可证槽位租约会跨升级保留。
+mkdir -p /var/lib/mmwx-guard /etc/systemd/system/mmw-agent.service.d
+mkdir -p /usr/local/share/mmwx-guard
+install -m 0644 /tmp/mmw-agent-new.manifest /usr/local/share/mmwx-guard/agent.manifest
+chmod 0700 /var/lib/mmwx-guard
+cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
+[Unit]
+Description=MMWX Agent Authorization Guard
+After=network-online.target
+Wants=network-online.target
+Before=mmw-agent.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mmwx-guardd --role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest
+Restart=always
+RestartSec=3
+RuntimeDirectory=mmwx-guard-agent
+RuntimeDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
+[Unit]
+Requires=mmwx-guard-agent.service
+After=mmwx-guard-agent.service
+
+[Service]
+Environment="MMWX_ACTION_GUARD=required"
+Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
+EOF
+
+GUARD_BIN=/usr/local/bin/mmwx-guardd
+GUARD_BAK=/usr/local/bin/mmwx-guardd.upgrade-backup
+GUARD_HAD_OLD=0
+if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; else rm -f "$GUARD_BAK"; fi
+rollback_guard() {
+    if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
+        mv -f "$GUARD_BAK" "$GUARD_BIN"
+        systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
+    else
+        systemctl disable --now mmwx-guard-agent >/dev/null 2>&1 || true
+        rm -f "$GUARD_BIN" /etc/systemd/system/mmwx-guard-agent.service /etc/systemd/system/mmw-agent.service.d/action-guard.conf
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+chmod 0755 /tmp/mmwx-guardd-new
+mv -f /tmp/mmwx-guardd-new "$GUARD_BIN.new"
+mv -f "$GUARD_BIN.new" "$GUARD_BIN"
+systemctl daemon-reload
+if ! systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 || ! systemctl restart mmwx-guard-agent; then
+    echo "ERROR: Agent Guard 启动失败，正在回滚" >&2
+    rollback_guard
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new.sig
+    exit 1
+fi
+guard_ready=0
+for i in $(seq 1 50); do
+    if [ -S /run/mmwx-guard-agent/guard.sock ]; then guard_ready=1; break; fi
+    sleep .1
+done
+if [ "$guard_ready" != "1" ]; then
+    echo "ERROR: Agent Guard socket 未就绪，正在回滚" >&2
+    rollback_guard
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new.sig
+    exit 1
+fi
+if ! "$SELF_BIN" __guard-health /run/mmwx-guard-agent/guard.sock; then
+    echo "ERROR: Agent Guard 健康检查失败，正在回滚" >&2
+    rollback_guard
+    exit 1
+fi
+rm -f /tmp/mmwx-guardd-new.sig
+echo "Guard replaced; identity and lease state preserved."
 
 # 替换二进制；完成后 agent 会原地 exec 新版本，不依赖特定 init 系统。
 # 直接 cp 到 /usr/local/bin/mmw-agent 会触发 "Text file busy",因为正在运行的 mmw-agent 进程占着该 inode。
 # 改成"先 cp 到旁路文件,再原子 mv 覆盖" — Linux rename(2) 不影响正在执行的进程映射的旧 inode,
 # 新 inode 接管该路径,旧 inode 直到进程退出才释放。
-cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new
-chmod +x /usr/local/bin/mmw-agent.new
-mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent
-rm -f /tmp/mmw-agent-new
-echo "Binary replaced; agent will self-exec the new version."
+if ! cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new || \
+   ! chmod +x /usr/local/bin/mmw-agent.new || \
+   ! mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent; then
+    echo "ERROR: Agent 替换失败，正在回滚 Agent Guard" >&2
+    rm -f /usr/local/bin/mmw-agent.new
+    rollback_guard
+    exit 1
+fi
+rm -f "$GUARD_BAK"
+rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig
+trap - EXIT
+echo "Binary replaced; Agent and Guard upgraded; agent will self-exec the new version."
 `
 	// 整个升级流程兜底超时 5 分钟 — 包括 GitHub 下载、二进制写入、SSE 流。
 	// 之前没设上限,sseStreamCmd 卡在 cmd.Wait + SSE 写之间能挂 2+ 天不释放 handler 协程
@@ -5748,6 +5953,16 @@ func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *htt
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
 		return
+	}
+	if h.leaseManager != nil {
+		releaseCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		releaseErr := h.leaseManager.Release(releaseCtx)
+		cancel()
+		if releaseErr != nil {
+			// 卸载不能因为许可证服务暂时不可达再次变成“杀不死”。未释放
+			// 的槽位会在租约+grace 到期后自动进入冷却 tombstone。
+			log.Printf("[Manage] WARN: release authoritative server slot before uninstall: %v", releaseErr)
+		}
 	}
 	log.Printf("[Manage] Starting Agent uninstall (stream)...")
 	cmd := exec.CommandContext(r.Context(), "bash", "-c", agentUninstallScheduleScript)

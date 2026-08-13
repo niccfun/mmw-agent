@@ -28,6 +28,7 @@ import (
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
+	"mmw-agent/internal/licenselease"
 	"mmw-agent/internal/limiter"
 	"mmw-agent/internal/securechan"
 	"mmw-agent/internal/util"
@@ -107,6 +108,7 @@ type Client struct {
 	// 许可证状态
 	licenseStatus *LicenseStatus
 	licenseMu     sync.RWMutex
+	leaseManager  *licenselease.Manager
 
 	// 加密通信
 	masterPubKey  ed25519.PublicKey
@@ -152,6 +154,12 @@ type Client struct {
 // SetXrayAuthHandler 注入「许可证配额授权变化 → 停/启 xray」回调。main.go 启动时调一次。
 func (c *Client) SetXrayAuthHandler(fn func(authorized bool)) {
 	c.onXrayAuthChange = fn
+}
+
+// SetLeaseManager injects the Agent-side signature verifier. Official builds
+// use it as the sole authority for Xray and PRO feature decisions.
+func (c *Client) SetLeaseManager(manager *licenselease.Manager) {
+	c.leaseManager = manager
 }
 
 // SetListenGateHooks 注入"端口隐身"钩子(见 onWSConnected / onWSDisconnected 字段)。
@@ -731,7 +739,8 @@ func (c *Client) authenticateMode(conn *websocket.Conn, probe bool) error {
 		"warp_installed":      warpInstalled,
 		"same_host_as_master": c.sameHostAsMaster(), // 主控同机 → 前端可显示「反代主控」入口
 		"agent_version":       version.Version,      // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
-		"xray_mode":           c.config.XrayMode,    // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
+		"agent_needs_lease":   c.agentNeedsLease(),
+		"xray_mode":           c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
 		"capabilities": map[string]bool{
 			"rpc":               rpcAvailable,
 			"stream":            rpcAvailable,
@@ -1042,6 +1051,7 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 		"public_ipv6":         publicIPv6,
 		"warp_installed":      warpInstalled,
 		"same_host_as_master": c.sameHostAsMaster(),
+		"agent_needs_lease":   c.agentNeedsLease(),
 	})
 
 	msg := map[string]interface{}{
@@ -1536,11 +1546,12 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	// IPv4-only master 反向请求全部 502。这里跟 WS auth/heartbeat 同款,把后台 ipProbeLoop
 	// 缓存的 v4/v6 一起上报,master 端优先用,fallback 才用 RemoteAddr 并强校验类型。
 	payload, _ := json.Marshal(map[string]interface{}{
-		"boot_time":   c.startTime.Unix(),
-		"listen_port": listenPort,
-		"local_time":  time.Now().Unix(),
-		"public_ipv4": c.getPublicIPv4(),
-		"public_ipv6": c.getPublicIPv6(),
+		"boot_time":         c.startTime.Unix(),
+		"listen_port":       listenPort,
+		"local_time":        time.Now().Unix(),
+		"public_ipv4":       c.getPublicIPv4(),
+		"public_ipv6":       c.getPublicIPv6(),
+		"agent_needs_lease": c.agentNeedsLease(),
 	})
 
 	u, err := url.Parse(c.config.MasterURL)
@@ -1556,12 +1567,18 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 
 	c.lastMasterContact.Store(time.Now().Unix())
 	var hbResp struct {
-		ServerTime int64  `json:"server_time"`
-		MasterURL  string `json:"master_url"`
+		ServerTime int64                  `json:"server_time"`
+		MasterURL  string                 `json:"master_url"`
+		AgentLease *licenselease.Delivery `json:"agent_lease"`
 	}
 	if err := json.Unmarshal(respBody, &hbResp); err == nil && hbResp.ServerTime > 0 {
 		if drift := time.Now().Unix() - hbResp.ServerTime; drift > 10 || drift < -10 {
 			log.Printf("[Agent] Clock drift detected: local time is %+ds from master", drift)
+		}
+	}
+	if hbResp.AgentLease != nil && c.leaseManager != nil {
+		if err := c.leaseManager.HandleDelivery(*hbResp.AgentLease); err != nil {
+			log.Printf("[Agent] Rejected signed Agent lease from heartbeat: %v", err)
 		}
 	}
 
@@ -2042,6 +2059,7 @@ const (
 	WSMsgTypeHeartbeatAck        = "heartbeat_ack"
 	WSMsgTypeLimiterConfig       = "limiter_config"
 	WSMsgTypeLicenseStatus       = "license_status"
+	WSMsgTypeAgentLease          = "agent_lease"
 	WSMsgTypeConfigUpdate        = "config_update"
 	WSMsgTypeRPCCall             = "rpc_call"        // master 反向 RPC 请求(替代 /api/child/* HTTP)
 	WSMsgTypeRPCReply            = "rpc_reply"       // agent 执行后返回响应(流式调用也用它作 end 帧)
@@ -2177,6 +2195,21 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		c.handleLicenseStatus(payload)
+	case WSMsgTypeAgentLease:
+		var payload licenselease.Delivery
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse agent_lease payload: %v", err)
+			return
+		}
+		if c.leaseManager == nil {
+			log.Printf("[Agent] Ignoring signed lease: lease manager is unavailable")
+			return
+		}
+		if err := c.leaseManager.HandleDelivery(payload); err != nil {
+			log.Printf("[Agent] Rejected signed agent lease: %v", err)
+			return
+		}
+		log.Printf("[Agent] Signed agent lease accepted")
 	case WSMsgTypeConfigUpdate:
 		var payload map[string]string
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -2278,6 +2311,9 @@ func (c *Client) handleTokenUpdate(payload WSTokenUpdatePayload) {
 
 	// 更新内存中的 token
 	c.config.Token = payload.ServerToken
+	if c.leaseManager != nil {
+		c.leaseManager.UpdateServerToken(payload.ServerToken)
+	}
 
 	log.Printf("[Agent] Token updated successfully in memory")
 }
@@ -2296,6 +2332,9 @@ func (c *Client) handleLicenseStatus(payload LicenseStatus) {
 }
 
 func (c *Client) HasProFeature(name string) bool {
+	if c.leaseManager != nil && c.leaseManager.Required() {
+		return c.leaseManager.HasFeature(name)
+	}
 	c.licenseMu.RLock()
 	defer c.licenseMu.RUnlock()
 	return c.licenseStatus.HasFeature(name)
@@ -2677,6 +2716,10 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 	}
 
 	c.handleProbeConfigUpdate(updates)
+}
+
+func (c *Client) agentNeedsLease() bool {
+	return c.leaseManager != nil && c.leaseManager.Required() && c.leaseManager.NeedsLease()
 }
 
 // handleProbeConfigUpdate 解析伪装探针采集配置(4 子开关 + ping 目标 + 间隔)。

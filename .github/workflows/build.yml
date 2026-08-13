@@ -10,6 +10,7 @@ jobs:
   build:
     name: Build Binaries
     runs-on: ubuntu-latest
+    environment: release-signing
     strategy:
       matrix:
         include:
@@ -39,7 +40,11 @@ jobs:
       # 这里把 fork 克隆到该相对位置(与 checkout 出来的仓库同级)。fork 的 module 名仍是
       # github.com/xtls/xray-core,所以只能相对路径 replace,不能用 git 版本 replace。
       - name: Clone xray-core fork (vision limiter)
-        run: git clone --depth 1 https://github.com/iluobei/Xray-core-mmwx.git ../xray-core-vision-limiter
+        env:
+          XRAY_FORK_COMMIT: d3fdae5833a92070414db588ee9893264147b789
+        run: |
+          git clone https://github.com/iluobei/Xray-core-mmwx.git ../xray-core-vision-limiter
+          git -C ../xray-core-vision-limiter checkout "$XRAY_FORK_COMMIT"
 
       - name: Go mod download
         run: go mod download
@@ -50,18 +55,37 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
         run: |
-          go build -trimpath -ldflags="-s -w" -o build/${{ matrix.output }} ./cmd/mmw-agent
+          go build -trimpath \
+            -ldflags="-s -w -X 'mmw-agent/internal/licenselease.requireSignedLease=true'" \
+            -o build/${{ matrix.output }} ./cmd/mmw-agent
+
+      - name: Generate signed exact-caller manifest
+        if: matrix.goos == 'linux'
+        env:
+          RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.RELEASE_MANIFEST_PRIVATE_KEY }}
+        run: |
+          test -n "$RELEASE_MANIFEST_PRIVATE_KEY" || { echo "::error::RELEASE_MANIFEST_PRIVATE_KEY is required"; exit 1; }
+          git clone --depth 1 "https://x-access-token:${{ secrets.GUARDD_PAT }}@github.com/iluobei/mmwx-guardd.git" /tmp/mmwx-guardd-tools
+          cd /tmp/mmwx-guardd-tools
+          go run ./cmd/mmwx-manifest -role agent \
+            -binary "$GITHUB_WORKSPACE/build/${{ matrix.output }}" \
+            -private-key "$RELEASE_MANIFEST_PRIVATE_KEY" \
+            -version "${{ github.ref_name }}" -goos linux -goarch "${{ matrix.goarch }}" \
+            -out "$GITHUB_WORKSPACE/build/mmw-agent-linux-${{ matrix.goarch }}.manifest"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.output }}
-          path: build/${{ matrix.output }}
+          path: |
+            build/${{ matrix.output }}
+            build/*.manifest
           retention-days: 7
 
   docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
+    environment: release-signing
     permissions:
       contents: read
       packages: write
@@ -72,7 +96,11 @@ jobs:
       # xray-core fork 必须在 ../xray-core-vision-limiter (跟 build job 同款相对路径 replace 要求)
       # docker build 用 --build-context xray-core-fork=<...> 把 fork 注入 build context
       - name: Clone xray-core fork (vision limiter)
-        run: git clone --depth 1 https://github.com/iluobei/Xray-core-mmwx.git ../xray-core-vision-limiter
+        env:
+          XRAY_FORK_COMMIT: d3fdae5833a92070414db588ee9893264147b789
+        run: |
+          git clone https://github.com/iluobei/Xray-core-mmwx.git ../xray-core-vision-limiter
+          git -C ../xray-core-vision-limiter checkout "$XRAY_FORK_COMMIT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -109,6 +137,13 @@ jobs:
           # Dockerfile 内 COPY --from=xray-core-fork . /build/xray-core-vision-limiter 解构
           build-contexts: |
             xray-core-fork=../xray-core-vision-limiter
+            guard-src=https://github.com/iluobei/mmwx-guardd.git
+          build-args: |
+            LICENSE_PUB_KEY=${{ secrets.LICENSE_PUB_KEY }}
+            RELEASE_MANIFEST_PUBLIC_KEY=${{ secrets.RELEASE_MANIFEST_PUBLIC_KEY }}
+          secrets: |
+            release_manifest_private_key=${{ secrets.RELEASE_MANIFEST_PRIVATE_KEY }}
+            GIT_AUTH_TOKEN=${{ secrets.GUARDD_PAT }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -116,6 +151,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    environment: release-signing
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -129,12 +165,32 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: Download signed Agent Guard artifacts
+        env:
+          GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
+        run: |
+          GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://license.miaomiaowux.com/downloads}"
+          for arch in amd64 arm64; do
+            for suffix in "" ".sig"; do
+              name="mmwx-guardd-linux-${arch}${suffix}"
+              curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+                "${GUARD_ASSET_BASE%/}/$name" -o "release/$name"
+            done
+          done
+          test "$(wc -c < release/mmwx-guardd-linux-amd64.sig)" -eq 64
+          test "$(wc -c < release/mmwx-guardd-linux-arm64.sig)" -eq 64
+          chmod +x release/mmw-agent-linux-amd64
+          release/mmw-agent-linux-amd64 __verify-update release/mmwx-guardd-linux-amd64 release/mmwx-guardd-linux-amd64.sig
+          release/mmw-agent-linux-amd64 __verify-update release/mmwx-guardd-linux-arm64 release/mmwx-guardd-linux-arm64.sig
+
       - name: Add executable permissions
         run: |
           chmod +x release/mmw-agent-linux-amd64
           chmod +x release/mmw-agent-linux-arm64
           chmod +x release/mmw-agent-darwin-amd64
           chmod +x release/mmw-agent-darwin-arm64
+          chmod +x release/mmwx-guardd-linux-amd64
+          chmod +x release/mmwx-guardd-linux-arm64
 
       - name: Create checksums
         run: |
@@ -143,6 +199,10 @@ jobs:
           sha256sum mmw-agent-linux-arm64 >> checksums.txt
           sha256sum mmw-agent-darwin-amd64 >> checksums.txt
           sha256sum mmw-agent-darwin-arm64 >> checksums.txt
+          sha256sum mmwx-guardd-linux-amd64 >> checksums.txt
+          sha256sum mmwx-guardd-linux-arm64 >> checksums.txt
+          sha256sum mmw-agent-linux-amd64.manifest >> checksums.txt
+          sha256sum mmw-agent-linux-arm64.manifest >> checksums.txt
 
       - name: Setup Go (for signing)
         uses: actions/setup-go@v5
@@ -178,6 +238,12 @@ jobs:
             release/mmw-agent-linux-arm64.sig
             release/mmw-agent-darwin-amd64.sig
             release/mmw-agent-darwin-arm64.sig
+            release/mmwx-guardd-linux-amd64
+            release/mmwx-guardd-linux-arm64
+            release/mmwx-guardd-linux-amd64.sig
+            release/mmwx-guardd-linux-arm64.sig
+            release/mmw-agent-linux-amd64.manifest
+            release/mmw-agent-linux-arm64.manifest
             release/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

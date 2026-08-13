@@ -33,7 +33,25 @@ COPY . .
 
 # 编译 — CGO 关 (纯静态;主控也是这个配置),embedded xray-core 是 Go 库静态链接进来
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -trimpath -ldflags="-s -w" -o /out/mmw-agent ./cmd/mmw-agent
+    go build -trimpath \
+      -ldflags="-s -w -X 'mmw-agent/internal/licenselease.requireSignedLease=true'" \
+      -o /out/mmw-agent ./cmd/mmw-agent
+
+FROM golang:1.26-bookworm AS guard-builder
+ARG TARGETARCH
+ARG LICENSE_PUB_KEY=""
+ARG RELEASE_MANIFEST_PUBLIC_KEY=""
+COPY --from=guard-src . /src
+COPY --from=builder /out/mmw-agent /caller/mmw-agent
+WORKDIR /src
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -trimpath \
+    -ldflags="-s -w -X 'main.version=docker' -X 'main.licensePublicKeyB64=${LICENSE_PUB_KEY}' -X 'main.releaseManifestPublicKeyB64=${RELEASE_MANIFEST_PUBLIC_KEY}'" \
+    -o /out/mmwx-guardd ./cmd/mmwx-guardd
+RUN --mount=type=secret,id=release_manifest_private_key \
+    key="$(cat /run/secrets/release_manifest_private_key)" \
+    && go run ./cmd/mmwx-manifest -role agent -binary /caller/mmw-agent \
+      -private-key "$key" -version docker -goos linux -goarch "${TARGETARCH:-amd64}" \
+      -out /out/agent.manifest
 
 # ─── Stage 2: runtime ───
 # Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟主控 Dockerfile + install-nginx.sh 同款
@@ -41,6 +59,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
 # debian:bookworm-slim apt 装的 nginx 1.22.x 不带 HTTP/3 模块,会导致 WSS / Reality 入站若用上 quic
 # 指令时 nginx 启动报 "invalid parameter quic"。base 仍是 debian bookworm 系列,其它 apt 包正常装。
 FROM nginx:mainline-bookworm
+
+ARG TARGETARCH
 
 # nginx 由 base image 预装(WSS / Reality 入站要用):二进制 /usr/sbin/nginx 跟 apt 装的同位置,
 # 配置 /etc/nginx/* 路径不变,现有 /usr/local/nginx/* symlink 链路零改动
@@ -66,6 +86,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sfn /etc/nginx/stream_servers /usr/local/nginx/stream_servers \
     && ln -sfn /etc/nginx/html           /usr/local/nginx/html
 
+COPY --from=guard-builder /out/mmwx-guardd /usr/local/bin/mmwx-guardd
+COPY --from=guard-builder /out/agent.manifest /usr/local/share/mmwx-guard/agent.manifest
+RUN chmod 0755 /usr/local/bin/mmwx-guardd
+
 COPY --from=builder /out/mmw-agent /usr/local/bin/mmw-agent
 
 COPY docker-entrypoint.sh /entrypoint.sh
@@ -77,9 +101,11 @@ RUN chmod +x /entrypoint.sh
 #  - MMWX_REQUIRE_HOST_NETWORK=1 entrypoint 启动时强制检查 host 网络,bridge 模式拒启
 ENV DOCKER=1 \
     MMWX_XRAY_MODE=embedded \
-    MMWX_REQUIRE_HOST_NETWORK=1
+    MMWX_REQUIRE_HOST_NETWORK=1 \
+    MMWX_ACTION_GUARD=required \
+    MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock
 
-VOLUME ["/etc/mmw-agent", "/usr/local/etc/xray", "/etc/nginx/cert", "/etc/nginx/servers"]
+VOLUME ["/etc/mmw-agent", "/usr/local/etc/xray", "/etc/nginx/cert", "/etc/nginx/servers", "/var/lib/mmwx-guard"]
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/local/bin/mmw-agent"]
