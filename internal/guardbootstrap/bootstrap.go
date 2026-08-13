@@ -222,11 +222,11 @@ func defaultDownloadBases() []string {
 	if base := strings.TrimSpace(os.Getenv("MMWX_GUARD_DOWNLOAD_BASE")); base != "" {
 		values = append(values, base)
 	}
+	values = append(values, "https://dl.miaomiaowux.com/mmwx-guard")
 	if licenseServer := strings.TrimSpace(os.Getenv("MMWX_LICENSE_SERVER")); licenseServer != "" {
 		values = append(values, strings.TrimRight(licenseServer, "/")+"/downloads")
 	}
 	values = append(values,
-		"https://dl.miaomiaowux.com/mmwx-guard",
 		"https://github.com/iluobei/mmw-agent/releases/latest/download",
 		"https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download",
 		"https://license.miaomiaowux.com/downloads",
