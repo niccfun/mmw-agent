@@ -218,7 +218,7 @@ func main() {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		health, err := guardclient.NewForSocket(guardclient.ModeRequired, os.Args[2]).Health(ctx)
+		health, err := guardclient.NewForSocket(os.Args[2]).Health(ctx)
 		if err != nil || !health.OK || health.Role != "agent" || !health.CallerVerified {
 			fmt.Fprintln(os.Stderr, "Agent Guard health check failed:", err)
 			os.Exit(1)
@@ -230,7 +230,7 @@ func main() {
 	// only replaced mmw-agent and could not install the newly split Guard. Do
 	// this before configuration and Xray startup so an official release never
 	// enters a partially authorized state. Docker images already bundle Guard.
-	if licenselease.Required() && !util.IsDocker() {
+	if !util.IsDocker() {
 		bootstrapCtx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 		if err := guardbootstrap.EnsureDefault(bootstrapCtx); err != nil {
 			cancel()
@@ -238,9 +238,8 @@ func main() {
 		}
 		cancel()
 		// The first process after upgrading a legacy unit has not yet inherited
-		// the newly written systemd drop-in. Enable Guard in this process too;
-		// subsequent restarts receive the same values from systemd.
-		_ = os.Setenv("MMWX_ACTION_GUARD", "required")
+		// the newly written systemd drop-in, so select the installed socket in
+		// this process too. Guard itself is always mandatory.
 		_ = os.Setenv("MMWX_GUARD_SOCKET", "/run/mmwx-guard-agent/guard.sock")
 	}
 
@@ -308,6 +307,13 @@ func main() {
 	manageHandler.SetXrayMode(cfg.XrayMode)
 	manageHandler.SetXrayAccessLogPath(xrayAccessLog) // 内嵌模式 service=xray 读它
 	agentGuard := guardclient.NewFromEnv()
+	guardCtx, guardCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	guardHealth, guardErr := agentGuard.Health(guardCtx)
+	guardCancel()
+	if guardErr != nil || !guardHealth.OK || guardHealth.Role != "agent" || !guardHealth.CallerVerified {
+		log.Fatalf("[Main] Agent Guard 必需但不可用，Agent 拒绝启动: health=%+v error=%v", guardHealth, guardErr)
+	}
+	log.Printf("[Main] Agent Guard connected: version=%s", guardHealth.Version)
 	manageHandler.SetActionGuard(agentGuard)
 
 	// WARP 服务 — 状态文件 warp.json 跟 config.yaml 同目录(空 cfgFile 时用当前工作目录)
@@ -324,10 +330,7 @@ func main() {
 		agentGuard,
 	)
 	if leaseErr != nil {
-		if licenselease.Required() {
-			log.Fatalf("[Main] 无法初始化 Agent 许可证身份: %v", leaseErr)
-		}
-		log.Printf("[Main] WARN: Agent 许可证身份不可用: %v", leaseErr)
+		log.Fatalf("[Main] 无法初始化 Agent 许可证身份: %v", leaseErr)
 	}
 	manageHandler.SetLeaseManager(leaseManager)
 

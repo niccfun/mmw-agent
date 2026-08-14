@@ -56,16 +56,22 @@ jobs:
           CGO_ENABLED: 0
         run: |
           go build -trimpath \
-            -ldflags="-s -w -X 'mmw-agent/internal/licenselease.requireSignedLease=true'" \
+            -ldflags="-s -w" \
             -o build/${{ matrix.output }} ./cmd/mmw-agent
 
       - name: Generate signed exact-caller manifest
         if: matrix.goos == 'linux'
         env:
           RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.RELEASE_MANIFEST_PRIVATE_KEY }}
+          GUARD_RELEASE: ${{ vars.GUARD_RELEASE }}
         run: |
           test -n "$RELEASE_MANIFEST_PRIVATE_KEY" || { echo "::error::RELEASE_MANIFEST_PRIVATE_KEY is required"; exit 1; }
-          git clone --depth 1 "https://x-access-token:${{ secrets.GUARDD_PAT }}@github.com/iluobei/mmwx-guardd.git" /tmp/mmwx-guardd-tools
+          case "$GUARD_RELEASE" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::GUARD_RELEASE must pin an immutable Guard release such as v0.1.0"; exit 1 ;;
+          esac
+          git clone --branch "$GUARD_RELEASE" --depth 1 \
+            "https://x-access-token:${{ secrets.GUARDD_PAT }}@github.com/iluobei/mmwx-guardd.git" /tmp/mmwx-guardd-tools
           cd /tmp/mmwx-guardd-tools
           go run ./cmd/mmwx-manifest -role agent \
             -binary "$GITHUB_WORKSPACE/build/${{ matrix.output }}" \
@@ -103,6 +109,32 @@ jobs:
           git clone https://github.com/iluobei/Xray-core-mmwx.git ../xray-core-vision-limiter
           git -C ../xray-core-vision-limiter checkout "$XRAY_FORK_COMMIT"
 
+      - name: Download immutable protected Guard
+        env:
+          GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
+          GUARD_RELEASE: ${{ vars.GUARD_RELEASE }}
+        run: |
+          case "$GUARD_RELEASE" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::GUARD_RELEASE must pin an immutable Guard release such as v0.1.0"; exit 1 ;;
+          esac
+          GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://dl.miaomiaowux.com/mmwx-guard}"
+          mkdir -p guard-dist
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/version.json" -o guard-dist/version.json
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/version.json.sig" -o guard-dist/version.json.sig
+          jq -e --arg release "$GUARD_RELEASE" \
+            '.protected == true and .protector == "garble" and .secret_injection == "xor-shares-v1" and .release == $release' guard-dist/version.json >/dev/null \
+            || { echo "::error::Pinned Guard release is not an approved Garble/XOR-shares build"; exit 1; }
+          for arch in amd64 arm64; do
+            for suffix in "" ".sig"; do
+              name="mmwx-guardd-agent-linux-${arch}${suffix}"
+              curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+                "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/$name" -o "guard-dist/$name"
+            done
+          done
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -138,7 +170,8 @@ jobs:
           # Dockerfile 内 COPY --from=xray-core-fork . /build/xray-core-vision-limiter 解构
           build-contexts: |
             xray-core-fork=../xray-core-vision-limiter
-            guard-src=https://github.com/iluobei/mmwx-guardd.git
+            guard-src=https://github.com/iluobei/mmwx-guardd.git#${{ vars.GUARD_RELEASE }}
+            guard-bin=./guard-dist
           build-args: |
             LICENSE_PUB_KEY=${{ secrets.LICENSE_PUB_KEY }}
             RELEASE_MANIFEST_PUBLIC_KEY=${{ secrets.RELEASE_MANIFEST_PUBLIC_KEY }}
@@ -169,6 +202,7 @@ jobs:
         env:
           AGENT_UPDATE_PRIVATE_KEY: ${{ secrets.AGENT_UPDATE_PRIVATE_KEY }}
           GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
+          GUARD_RELEASE: ${{ vars.GUARD_RELEASE }}
         run: |
           test -n "$AGENT_UPDATE_PRIVATE_KEY" || { echo "::error::AGENT_UPDATE_PRIVATE_KEY is required"; exit 1; }
           cd tools/sign
@@ -176,19 +210,31 @@ jobs:
             ../../package/mmw-agent-linux-amd64 ../../package/mmw-agent-linux-arm64 \
             ../../package/mmw-agent-darwin-amd64 ../../package/mmw-agent-darwin-arm64
           cd ../..
+          case "$GUARD_RELEASE" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::GUARD_RELEASE must pin an immutable Guard release such as v0.1.0"; exit 1 ;;
+          esac
           GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://dl.miaomiaowux.com/mmwx-guard}"
           chmod +x package/mmw-agent-linux-amd64
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/version.json" -o package/guard-version.json
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/version.json.sig" -o package/guard-version.json.sig
+          package/mmw-agent-linux-amd64 __verify-update package/guard-version.json package/guard-version.json.sig
+          jq -e --arg release "$GUARD_RELEASE" \
+            '.protected == true and .protector == "garble" and .secret_injection == "xor-shares-v1" and .release == $release' package/guard-version.json >/dev/null \
+            || { echo "::error::Pinned Guard release is not an approved Garble/XOR-shares build"; exit 1; }
           for arch in amd64 arm64; do
             for suffix in "" ".sig"; do
-              name="mmwx-guardd-linux-${arch}${suffix}"
+              name="mmwx-guardd-agent-linux-${arch}${suffix}"
               curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-                "${GUARD_ASSET_BASE%/}/$name" -o "package/$name"
+                "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/$name" -o "package/$name"
             done
             package/mmw-agent-linux-amd64 __verify-update \
-              "package/mmwx-guardd-linux-${arch}" "package/mmwx-guardd-linux-${arch}.sig"
+              "package/mmwx-guardd-agent-linux-${arch}" "package/mmwx-guardd-agent-linux-${arch}.sig"
           done
           cd package
-          sha256sum mmw-agent-* mmwx-guardd-* > checksums.txt
+          sha256sum mmw-agent-* mmwx-guardd-* guard-version.json* > checksums.txt
       - uses: actions/upload-artifact@v4
         with:
           name: mmw-agent-test-bundle-${{ github.sha }}
@@ -216,20 +262,33 @@ jobs:
       - name: Download signed Agent Guard artifacts
         env:
           GUARD_ASSET_BASE: ${{ secrets.GUARD_ASSET_BASE }}
+          GUARD_RELEASE: ${{ vars.GUARD_RELEASE }}
         run: |
+          case "$GUARD_RELEASE" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::GUARD_RELEASE must pin an immutable Guard release such as v0.1.0"; exit 1 ;;
+          esac
           GUARD_ASSET_BASE="${GUARD_ASSET_BASE:-https://dl.miaomiaowux.com/mmwx-guard}"
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/version.json" -o release/guard-version.json
+          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
+            "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/version.json.sig" -o release/guard-version.json.sig
+          jq -e --arg release "$GUARD_RELEASE" \
+            '.protected == true and .protector == "garble" and .secret_injection == "xor-shares-v1" and .release == $release' release/guard-version.json >/dev/null \
+            || { echo "::error::Pinned Guard release is not an approved Garble/XOR-shares build"; exit 1; }
           for arch in amd64 arm64; do
             for suffix in "" ".sig"; do
-              name="mmwx-guardd-linux-${arch}${suffix}"
+              name="mmwx-guardd-agent-linux-${arch}${suffix}"
               curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-                "${GUARD_ASSET_BASE%/}/$name" -o "release/$name"
+                "${GUARD_ASSET_BASE%/}/releases/${GUARD_RELEASE}/$name" -o "release/$name"
             done
           done
-          test "$(wc -c < release/mmwx-guardd-linux-amd64.sig)" -eq 64
-          test "$(wc -c < release/mmwx-guardd-linux-arm64.sig)" -eq 64
+          test "$(wc -c < release/mmwx-guardd-agent-linux-amd64.sig)" -eq 64
+          test "$(wc -c < release/mmwx-guardd-agent-linux-arm64.sig)" -eq 64
           chmod +x release/mmw-agent-linux-amd64
-          release/mmw-agent-linux-amd64 __verify-update release/mmwx-guardd-linux-amd64 release/mmwx-guardd-linux-amd64.sig
-          release/mmw-agent-linux-amd64 __verify-update release/mmwx-guardd-linux-arm64 release/mmwx-guardd-linux-arm64.sig
+          release/mmw-agent-linux-amd64 __verify-update release/guard-version.json release/guard-version.json.sig
+          release/mmw-agent-linux-amd64 __verify-update release/mmwx-guardd-agent-linux-amd64 release/mmwx-guardd-agent-linux-amd64.sig
+          release/mmw-agent-linux-amd64 __verify-update release/mmwx-guardd-agent-linux-arm64 release/mmwx-guardd-agent-linux-arm64.sig
 
       - name: Add executable permissions
         run: |
@@ -237,20 +296,19 @@ jobs:
           chmod +x release/mmw-agent-linux-arm64
           chmod +x release/mmw-agent-darwin-amd64
           chmod +x release/mmw-agent-darwin-arm64
-          chmod +x release/mmwx-guardd-linux-amd64
-          chmod +x release/mmwx-guardd-linux-arm64
+          chmod +x release/mmwx-guardd-agent-linux-amd64
+          chmod +x release/mmwx-guardd-agent-linux-arm64
 
       - name: Create checksums
         run: |
           cd release
-          sha256sum mmw-agent-linux-amd64 > checksums.txt
-          sha256sum mmw-agent-linux-arm64 >> checksums.txt
-          sha256sum mmw-agent-darwin-amd64 >> checksums.txt
-          sha256sum mmw-agent-darwin-arm64 >> checksums.txt
-          sha256sum mmwx-guardd-linux-amd64 >> checksums.txt
-          sha256sum mmwx-guardd-linux-arm64 >> checksums.txt
-          sha256sum mmw-agent-linux-amd64.manifest >> checksums.txt
-          sha256sum mmw-agent-linux-arm64.manifest >> checksums.txt
+          sha256sum \
+            mmw-agent-linux-amd64 mmw-agent-linux-arm64 \
+            mmw-agent-darwin-amd64 mmw-agent-darwin-arm64 \
+            mmwx-guardd-agent-linux-amd64 mmwx-guardd-agent-linux-arm64 \
+            guard-version.json guard-version.json.sig \
+            mmw-agent-linux-amd64.manifest mmw-agent-linux-arm64.manifest \
+            > checksums.txt
 
       - name: Setup Go (for signing)
         uses: actions/setup-go@v5
@@ -286,10 +344,12 @@ jobs:
             release/mmw-agent-linux-arm64.sig
             release/mmw-agent-darwin-amd64.sig
             release/mmw-agent-darwin-arm64.sig
-            release/mmwx-guardd-linux-amd64
-            release/mmwx-guardd-linux-arm64
-            release/mmwx-guardd-linux-amd64.sig
-            release/mmwx-guardd-linux-arm64.sig
+            release/mmwx-guardd-agent-linux-amd64
+            release/mmwx-guardd-agent-linux-arm64
+            release/mmwx-guardd-agent-linux-amd64.sig
+            release/mmwx-guardd-agent-linux-arm64.sig
+            release/guard-version.json
+            release/guard-version.json.sig
             release/mmw-agent-linux-amd64.manifest
             release/mmw-agent-linux-arm64.manifest
             release/checksums.txt

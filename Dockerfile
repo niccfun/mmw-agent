@@ -1,7 +1,9 @@
 # mmw-agent Docker 镜像 — embedded xray + 内置 nginx,host 网络模式。
 #
 # Build:
-#   本地:docker build --build-context xray-core-fork=../xray-core-vision-limiter -t mmw-agent:test .
+#   本地:docker build --build-context xray-core-fork=../xray-core-vision-limiter \
+#          --build-context guard-bin=../guard-dist \
+#          --build-context guard-src=../mmwx-guardd -t mmw-agent:test .
 #   CI:  workflow 先 clone fork 到 ../xray-core-vision-limiter,再用 --build-context 同上
 #
 # 为什么需要 --build-context xray-core-fork:
@@ -33,20 +35,21 @@ COPY . .
 
 # 编译 — CGO 关 (纯静态;主控也是这个配置),embedded xray-core 是 Go 库静态链接进来
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -trimpath \
-      -ldflags="-s -w -X 'mmw-agent/internal/licenselease.requireSignedLease=true'" \
+    go build -trimpath -ldflags="-s -w" \
       -o /out/mmw-agent ./cmd/mmw-agent
 
 FROM golang:1.26-bookworm AS guard-builder
 ARG TARGETARCH
-ARG LICENSE_PUB_KEY=""
-ARG RELEASE_MANIFEST_PUBLIC_KEY=""
 COPY --from=guard-src . /src
+COPY --from=guard-bin . /guard-dist
 COPY --from=builder /out/mmw-agent /caller/mmw-agent
 WORKDIR /src
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH:-amd64} go build -trimpath \
-    -ldflags="-s -w -X 'main.version=docker' -X 'main.licensePublicKeyB64=${LICENSE_PUB_KEY}' -X 'main.releaseManifestPublicKeyB64=${RELEASE_MANIFEST_PUBLIC_KEY}'" \
-    -o /out/mmwx-guardd ./cmd/mmwx-guardd
+RUN guard="/guard-dist/mmwx-guardd-agent-linux-${TARGETARCH:-amd64}" \
+    && test -s "$guard" && test -s "$guard.sig" \
+    && chmod 0755 /caller/mmw-agent \
+    && /caller/mmw-agent __verify-update /guard-dist/version.json /guard-dist/version.json.sig \
+    && /caller/mmw-agent __verify-update "$guard" "$guard.sig" \
+    && install -D -m 0755 "$guard" /out/mmwx-guardd
 RUN --mount=type=secret,id=release_manifest_private_key \
     key="$(cat /run/secrets/release_manifest_private_key)" \
     && go run ./cmd/mmwx-manifest -role agent -binary /caller/mmw-agent \
@@ -102,7 +105,6 @@ RUN chmod +x /entrypoint.sh
 ENV DOCKER=1 \
     MMWX_XRAY_MODE=embedded \
     MMWX_REQUIRE_HOST_NETWORK=1 \
-    MMWX_ACTION_GUARD=required \
     MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock
 
 VOLUME ["/etc/mmw-agent", "/usr/local/etc/xray", "/etc/nginx/cert", "/etc/nginx/servers", "/var/lib/mmwx-guard"]

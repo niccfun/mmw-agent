@@ -4,16 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
 	"mmw-agent/internal/guardclient"
 )
-
-// Kept as a release-build switch. Cryptographic verification and the slot
-// identity now live exclusively in the closed Guard, not in the open Agent.
-var requireSignedLease = "false"
 
 type Delivery struct {
 	Reservation      string `json:"reservation"`
@@ -23,7 +18,7 @@ type Delivery struct {
 
 type Manager struct {
 	mu            sync.RWMutex
-	guard         *guardclient.Client
+	guard         guardAuthority
 	statePath     string
 	status        guardclient.SlotStatus
 	nextRefresh   time.Time
@@ -31,12 +26,15 @@ type Manager struct {
 	onChange      func(bool)
 }
 
-func Required() bool {
-	required, _ := strconv.ParseBool(requireSignedLease)
-	return required
+type guardAuthority interface {
+	Enabled() bool
+	SlotStatus(context.Context) (guardclient.SlotStatus, error)
+	ActivateSlot(context.Context, guardclient.SlotDelivery) (guardclient.SlotStatus, error)
+	RefreshSlot(context.Context) (guardclient.SlotStatus, error)
+	ReleaseSlot(context.Context) error
 }
 
-func New(_ string, statePath, _ string, guard *guardclient.Client) (*Manager, error) {
+func New(_ string, statePath, _ string, guard guardAuthority) (*Manager, error) {
 	if guard == nil || !guard.Enabled() {
 		return nil, errors.New("Agent Guard is required for authoritative server slots")
 	}
@@ -49,7 +47,7 @@ func New(_ string, statePath, _ string, guard *guardclient.Client) (*Manager, er
 	return m, nil
 }
 
-func (m *Manager) Required() bool { return Required() }
+func (m *Manager) Required() bool { return true }
 
 func (m *Manager) UpdateServerToken(_ string) {
 	// The server hash is signed into the reservation and lease. The open Agent

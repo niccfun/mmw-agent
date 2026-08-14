@@ -5629,10 +5629,10 @@ MIRRORS=(
     "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 )
 GUARD_MIRRORS=(
-    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
-    "https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
-    "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
-    "https://license.miaomiaowux.com/downloads/mmwx-guardd-linux-${ARCH_NAME}"
+    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-agent-linux-${ARCH_NAME}"
+    "https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-agent-linux-${ARCH_NAME}"
+    "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmwx-guardd-agent-linux-${ARCH_NAME}"
+    "https://license.miaomiaowux.com/downloads/mmwx-guardd-agent-linux-${ARCH_NAME}"
 )
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -5724,6 +5724,11 @@ if [ "$manifest_download_ok" != "1" ]; then
     echo "ERROR: Agent 发布签名清单下载失败，现有 Agent/Guard 均未改动" >&2
     exit 1
 fi
+chmod 0755 /tmp/mmwx-guardd-new
+if ! /tmp/mmwx-guardd-new --role agent --manifest /tmp/mmw-agent-new.manifest --verify-manifest-for /tmp/mmw-agent-new; then
+    echo "ERROR: Agent 二进制与官方签名清单不匹配，现有 Agent/Guard 均未改动" >&2
+    exit 1
+fi
 
 # 安装/升级 Guard 服务。只替换二进制和 unit，不删除 /var/lib/mmwx-guard，
 # 因而设备 Ed25519 身份和当前许可证槽位租约会跨升级保留。
@@ -5757,7 +5762,6 @@ Requires=mmwx-guard-agent.service
 After=mmwx-guard-agent.service
 
 [Service]
-Environment="MMWX_ACTION_GUARD=required"
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
 
@@ -5796,13 +5800,8 @@ if [ "$guard_ready" != "1" ]; then
     rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new.sig
     exit 1
 fi
-if ! "$SELF_BIN" __guard-health /run/mmwx-guard-agent/guard.sock; then
-    echo "ERROR: Agent Guard 健康检查失败，正在回滚" >&2
-    rollback_guard
-    exit 1
-fi
 rm -f /tmp/mmwx-guardd-new.sig
-echo "Guard replaced; identity and lease state preserved."
+echo "Guard replaced; exact caller manifest verified; identity and lease state preserved."
 
 # 替换二进制；完成后 agent 会原地 exec 新版本，不依赖特定 init 系统。
 # 直接 cp 到 /usr/local/bin/mmw-agent 会触发 "Text file busy",因为正在运行的 mmw-agent 进程占着该 inode。

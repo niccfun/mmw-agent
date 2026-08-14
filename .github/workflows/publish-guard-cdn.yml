@@ -3,8 +3,8 @@ name: Publish Guard to R2 CDN
 on:
   workflow_dispatch:
     inputs:
-      guard_ref:
-        description: 'Private Guard repository commit SHA (exactly 40 lowercase hex characters)'
+      guard_release:
+        description: 'Immutable private Guard release (for example v0.1.0)'
         required: true
 
 permissions:
@@ -16,79 +16,54 @@ concurrency:
 
 jobs:
   publish:
-    name: Build, sign, and upload Guard
+    name: Verify and republish protected Guard
     runs-on: ubuntu-latest
     environment: release-signing
     env:
       EXPECTED_UPDATE_PUBLIC_KEY: 3aGta5gVWH1jVUInTJopAT7xB8soc4A8FgGEgHrVq6k=
     steps:
-      - name: Validate exact Guard revision
+      - name: Validate immutable Guard release
         env:
-          GUARD_REF: ${{ inputs.guard_ref }}
+          GUARD_RELEASE: ${{ inputs.guard_release }}
         run: |
-          if ! printf '%s' "$GUARD_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::guard_ref must be an exact 40-character lowercase commit SHA"
-            exit 1
-          fi
+          case "$GUARD_RELEASE" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::guard_release must use a version such as v0.1.0"; exit 1 ;;
+          esac
 
-      - name: Checkout private Guard source
+      - name: Checkout the exact private Guard release
         env:
           GUARDD_PAT: ${{ secrets.GUARDD_PAT }}
-          GUARD_REF: ${{ inputs.guard_ref }}
+          GUARD_RELEASE: ${{ inputs.guard_release }}
         run: |
           test -n "$GUARDD_PAT" || { echo "::error::GUARDD_PAT is required"; exit 1; }
-          git clone "https://x-access-token:${GUARDD_PAT}@github.com/iluobei/mmwx-guardd.git" guard-src
-          git -C guard-src checkout --detach "$GUARD_REF"
-          test "$(git -C guard-src rev-parse HEAD)" = "$GUARD_REF"
+          git clone --branch "$GUARD_RELEASE" --depth 1 \
+            "https://x-access-token:${GUARDD_PAT}@github.com/iluobei/mmwx-guardd.git" guard-src
+          test "$(git -C guard-src describe --tags --exact-match)" = "$GUARD_RELEASE"
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
           cache: false
 
-      - name: Test and build Guard
+      - name: Download, checksum, and verify protected release artifacts
         env:
-          GUARD_REF: ${{ inputs.guard_ref }}
-          LICENSE_PUB_KEY: ${{ secrets.LICENSE_PUB_KEY }}
-          RELEASE_MANIFEST_PUBLIC_KEY: ${{ secrets.RELEASE_MANIFEST_PUBLIC_KEY }}
+          GH_TOKEN: ${{ secrets.GUARDD_PAT }}
         run: |
-          test -n "$LICENSE_PUB_KEY" || { echo "::error::LICENSE_PUB_KEY is required"; exit 1; }
-          test -n "$RELEASE_MANIFEST_PUBLIC_KEY" || { echo "::error::RELEASE_MANIFEST_PUBLIC_KEY is required"; exit 1; }
-          cd guard-src
-          go test ./...
-          mkdir -p ../dist
-          short_ref=$(printf '%s' "$GUARD_REF" | cut -c1-12)
+          mkdir -p dist
+          gh release download "${{ inputs.guard_release }}" --repo iluobei/mmwx-guardd \
+            --dir dist --pattern 'mmwx-guardd*linux-*' --pattern checksums.txt --pattern 'version.json*'
+          (cd dist && sha256sum -c checksums.txt)
+          (cd guard-src && go run ./cmd/mmwx-verify \
+            -public-key "$EXPECTED_UPDATE_PUBLIC_KEY" ../dist/version.json ../dist/version.json.sig)
+          jq -e --arg release "${{ inputs.guard_release }}" \
+            '.protected == true and .protector == "garble" and .secret_injection == "xor-shares-v1" and .release == $release' dist/version.json >/dev/null \
+            || { echo "::error::Guard release is not an approved Garble/XOR-shares build"; exit 1; }
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
-              -ldflags="-s -w -X 'main.version=cdn-${short_ref}' -X 'main.licensePublicKeyB64=${LICENSE_PUB_KEY}' -X 'main.releaseManifestPublicKeyB64=${RELEASE_MANIFEST_PUBLIC_KEY}'" \
-              -o "../dist/mmwx-guardd-linux-${arch}" ./cmd/mmwx-guardd
+            (cd guard-src && go run ./cmd/mmwx-verify \
+              -public-key "$EXPECTED_UPDATE_PUBLIC_KEY" \
+              "../dist/mmwx-guardd-agent-linux-${arch}" "../dist/mmwx-guardd-agent-linux-${arch}.sig")
           done
-
-      - name: Sign Guard artifacts and verify signing identity
-        env:
-          AGENT_UPDATE_PRIVATE_KEY: ${{ secrets.AGENT_UPDATE_PRIVATE_KEY }}
-        run: |
-          test -n "$AGENT_UPDATE_PRIVATE_KEY" || { echo "::error::AGENT_UPDATE_PRIVATE_KEY is required"; exit 1; }
-          cd guard-src
-          go run ./cmd/mmwx-sign \
-            -private-key "$AGENT_UPDATE_PRIVATE_KEY" \
-            -expected-public-key "$EXPECTED_UPDATE_PUBLIC_KEY" \
-            ../dist/mmwx-guardd-linux-amd64 ../dist/mmwx-guardd-linux-arm64
-          cd ../dist
-          test "$(wc -c < mmwx-guardd-linux-amd64.sig)" -eq 64
-          test "$(wc -c < mmwx-guardd-linux-arm64.sig)" -eq 64
-          sha256sum mmwx-guardd-linux-amd64 mmwx-guardd-linux-amd64.sig \
-            mmwx-guardd-linux-arm64 mmwx-guardd-linux-arm64.sig > checksums.txt
-
-      - name: Generate immutable publication metadata
-        env:
-          GUARD_REF: ${{ inputs.guard_ref }}
-        run: |
-          jq -n \
-            --arg commit "$GUARD_REF" \
-            --arg built_at "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
-            --arg source "iluobei/mmwx-guardd" \
-            '{schema:1, source:$source, commit:$commit, built_at:$built_at}' > dist/version.json
 
       - name: Upload immutable and current assets to R2
         env:
@@ -97,12 +72,12 @@ jobs:
           AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
-          GUARD_REF: ${{ inputs.guard_ref }}
+          GUARD_RELEASE: ${{ inputs.guard_release }}
         run: |
           test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY" \
             && test -n "$BUCKET" || { echo "::error::R2 credentials are incomplete"; exit 1; }
-          immutable_prefix="mmwx-guard/releases/${GUARD_REF}"
-          for file in dist/mmwx-guardd-linux-* dist/checksums.txt dist/version.json; do
+          immutable_prefix="mmwx-guard/releases/${GUARD_RELEASE}"
+          for file in dist/mmwx-guardd-agent-linux-* dist/checksums.txt dist/version.json*; do
             name=$(basename "$file")
             content_type=application/octet-stream
             [ "$name" = version.json ] && content_type=application/json
@@ -112,23 +87,20 @@ jobs:
               --content-type "$content_type" \
               --cache-control "public, max-age=31536000, immutable"
           done
-          for file in dist/mmwx-guardd-linux-* dist/checksums.txt; do
+          for file in dist/mmwx-guardd-agent-linux-* dist/checksums.txt dist/version.json*; do
             name=$(basename "$file")
             content_type=application/octet-stream
+            [ "$name" = version.json ] && content_type=application/json
             [ "$name" = checksums.txt ] && content_type=text/plain
             aws s3 cp "$file" "s3://$BUCKET/mmwx-guard/$name" \
               --endpoint-url "$R2_ENDPOINT" \
               --content-type "$content_type" \
               --cache-control "no-store"
           done
-          aws s3 cp dist/version.json "s3://$BUCKET/mmwx-guard/version.json" \
-            --endpoint-url "$R2_ENDPOINT" \
-            --content-type application/json \
-            --cache-control "no-store"
-          echo "Guard published: https://dl.miaomiaowux.com/mmwx-guard/ (commit=$GUARD_REF)"
+          echo "Protected Guard published: https://dl.miaomiaowux.com/mmwx-guard/ (release=$GUARD_RELEASE)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mmwx-guard-${{ inputs.guard_ref }}
+          name: mmwx-guard-${{ inputs.guard_release }}
           path: dist/
           retention-days: 7

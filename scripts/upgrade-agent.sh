@@ -19,6 +19,9 @@ REPO="iluobei/mmw-agent"
 BIN="/usr/local/bin/mmw-agent"
 GUARD_BIN="/usr/local/bin/mmwx-guardd"
 TARGET="${1:-latest}"
+AGENT_ASSET_BASE="${MMWX_AGENT_ASSET_BASE:-}"
+GUARD_DOWNLOAD_BASE="${MMWX_GUARD_DOWNLOAD_BASE:-}"
+GUARD_RELEASE="${MMWX_GUARD_RELEASE:-}"
 BAK=""
 
 err() { echo "[ERROR] $*" >&2; exit 1; }
@@ -39,13 +42,13 @@ log "架构: $ARCH_NAME"
 # 2. 解析目标版本 path(URL 前缀由镜像链各自接上)
 if [ "$TARGET" = "latest" ]; then
     PATH_SUFFIX="releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    GUARD_PATH_SUFFIX="releases/latest/download/mmwx-guardd-linux-${ARCH_NAME}"
+    GUARD_PATH_SUFFIX="releases/latest/download/mmwx-guardd-agent-linux-${ARCH_NAME}"
     log "目标: GitHub latest"
 else
     # 允许带或不带 v 前缀
     case "$TARGET" in v*) TAG="$TARGET" ;; *) TAG="v$TARGET" ;; esac
     PATH_SUFFIX="releases/download/${TAG}/mmw-agent-linux-${ARCH_NAME}"
-    GUARD_PATH_SUFFIX="releases/download/${TAG}/mmwx-guardd-linux-${ARCH_NAME}"
+    GUARD_PATH_SUFFIX="releases/download/${TAG}/mmwx-guardd-agent-linux-${ARCH_NAME}"
     log "目标: $TAG"
 fi
 
@@ -58,11 +61,21 @@ MIRRORS=(
     "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
 )
 GUARD_MIRRORS=(
-    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-linux-${ARCH_NAME}"
+    "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-agent-linux-${ARCH_NAME}"
     "https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
     "https://gh-proxy.com/https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
-    "https://license.miaomiaowux.com/downloads/mmwx-guardd-linux-${ARCH_NAME}"
+    "https://license.miaomiaowux.com/downloads/mmwx-guardd-agent-linux-${ARCH_NAME}"
 )
+if [ -n "$AGENT_ASSET_BASE" ]; then
+    MIRRORS=("${AGENT_ASSET_BASE%/}/mmw-agent-linux-${ARCH_NAME}")
+fi
+if [ -n "$GUARD_DOWNLOAD_BASE" ]; then
+    guard_asset_base="${GUARD_DOWNLOAD_BASE%/}"
+    if [ -n "$GUARD_RELEASE" ]; then
+        guard_asset_base="$guard_asset_base/releases/$GUARD_RELEASE"
+    fi
+    GUARD_MIRRORS=("$guard_asset_base/mmwx-guardd-agent-linux-${ARCH_NAME}")
+fi
 TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
 GUARD_TMP="$(mktemp /tmp/mmwx-guardd-new.XXXXXX)"
 MANIFEST_TMP="$(mktemp /tmp/mmw-agent-new-manifest.XXXXXX)"
@@ -146,6 +159,10 @@ for URL in "${MIRRORS[@]}"; do
     fi
 done
 [ "$manifest_download_ok" = "1" ] || err "Agent 发布签名清单下载失败，未替换任何二进制"
+chmod 0755 "$TMP" "$GUARD_TMP"
+if ! "$GUARD_TMP" --role agent --manifest "$MANIFEST_TMP" --verify-manifest-for "$TMP"; then
+    err "Agent 二进制与官方签名清单不匹配，未替换任何二进制"
+fi
 
 # 4. 与现有 binary 对比;一样就不动
 agent_changed=1
@@ -165,6 +182,22 @@ fi
 [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 || err "联合升级要求 systemd，请重新运行 Agent 安装命令"
 mkdir -p /var/lib/mmwx-guard /etc/systemd/system/mmw-agent.service.d
 mkdir -p /usr/local/share/mmwx-guard
+MANIFEST_BAK="/usr/local/share/mmwx-guard/agent.manifest.upgrade-backup"
+GUARD_UNIT="/etc/systemd/system/mmwx-guard-agent.service"
+GUARD_UNIT_BAK="${GUARD_UNIT}.upgrade-backup"
+AGENT_DROPIN="/etc/systemd/system/mmw-agent.service.d/action-guard.conf"
+AGENT_DROPIN_BAK="${AGENT_DROPIN}.upgrade-backup"
+MANIFEST_HAD_OLD=0
+GUARD_UNIT_HAD_OLD=0
+AGENT_DROPIN_HAD_OLD=0
+if [ -f /usr/local/share/mmwx-guard/agent.manifest ]; then
+    cp -p /usr/local/share/mmwx-guard/agent.manifest "$MANIFEST_BAK"
+    MANIFEST_HAD_OLD=1
+else
+    rm -f "$MANIFEST_BAK"
+fi
+if [ -f "$GUARD_UNIT" ]; then cp -p "$GUARD_UNIT" "$GUARD_UNIT_BAK"; GUARD_UNIT_HAD_OLD=1; else rm -f "$GUARD_UNIT_BAK"; fi
+if [ -f "$AGENT_DROPIN" ]; then cp -p "$AGENT_DROPIN" "$AGENT_DROPIN_BAK"; AGENT_DROPIN_HAD_OLD=1; else rm -f "$AGENT_DROPIN_BAK"; fi
 install -m 0644 "$MANIFEST_TMP" /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
@@ -190,23 +223,32 @@ cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 Requires=mmwx-guard-agent.service
 After=mmwx-guard-agent.service
 [Service]
-Environment="MMWX_ACTION_GUARD=required"
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
 GUARD_BAK="${GUARD_BIN}.upgrade-backup"
 GUARD_HAD_OLD=0
 if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; else rm -f "$GUARD_BAK"; fi
 rollback_guard() {
+    systemctl stop mmwx-guard-agent >/dev/null 2>&1 || true
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
         mv -f "$GUARD_BAK" "$GUARD_BIN"
+    else
+        rm -f "$GUARD_BIN"
+    fi
+    if [ "$MANIFEST_HAD_OLD" = "1" ] && [ -f "$MANIFEST_BAK" ]; then
+        mv -f "$MANIFEST_BAK" /usr/local/share/mmwx-guard/agent.manifest
+    else
+        rm -f /usr/local/share/mmwx-guard/agent.manifest
+    fi
+    if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then mv -f "$GUARD_UNIT_BAK" "$GUARD_UNIT"; else rm -f "$GUARD_UNIT"; fi
+    if [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"; else rm -f "$AGENT_DROPIN"; fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$GUARD_HAD_OLD" = "1" ]; then
         systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
     else
-        systemctl disable --now mmwx-guard-agent >/dev/null 2>&1 || true
-        rm -f "$GUARD_BIN" /etc/systemd/system/mmwx-guard-agent.service /etc/systemd/system/mmw-agent.service.d/action-guard.conf
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl disable mmwx-guard-agent >/dev/null 2>&1 || true
     fi
 }
-chmod 0755 "$GUARD_TMP"
 mv -f "$GUARD_TMP" "${GUARD_BIN}.new"
 mv -f "${GUARD_BIN}.new" "$GUARD_BIN"
 systemctl daemon-reload
@@ -219,20 +261,8 @@ if [ ! -S /run/mmwx-guard-agent/guard.sock ]; then
     rollback_guard
     err "Agent Guard 未就绪，已回滚；Agent 未替换"
 fi
-guard_health_ok=0
-if "$BIN" __guard-health /run/mmwx-guard-agent/guard.sock >/dev/null 2>&1; then
-    guard_health_ok=1
-elif command -v curl >/dev/null 2>&1 && \
-     curl -fsS --max-time 5 --unix-socket /run/mmwx-guard-agent/guard.sock http://localhost/v1/health | grep -q '"role":"agent"'; then
-    # Compatibility for an older installed Agent that lacks __guard-health.
-    guard_health_ok=1
-fi
-if [ "$guard_health_ok" != "1" ]; then
-    rollback_guard
-    err "Agent Guard 健康检查失败，已回滚；Agent 未替换"
-fi
 rm -f "$GUARD_TMP.sig"
-log "✅ Agent Guard 已升级，设备身份与租约已保留"
+log "✅ Agent Guard 已启动，精确调用方清单已离线验证"
 
 # 5. 原子替换(避免 "text file busy" — 旧进程占着 inode 不能直接 cp 覆盖)
 chmod +x "$TMP"
@@ -246,17 +276,20 @@ if [ "$agent_changed" = "1" ]; then
 else
     rm -f "$TMP"
 fi
-rm -f "$GUARD_BAK"
 rm -f "$TMP.sig" "$GUARD_TMP" "$GUARD_TMP.sig"
-trap - EXIT
-log "Agent 与 Guard 联合升级已完成"
+log "Agent 与 Guard 已替换，等待联合启动验证"
 
 # 6. 重启服务 — 顺序探测,谁活跃用谁
 restarted=0
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 \
    && systemctl list-unit-files mmw-agent.service >/dev/null 2>&1; then
     log "systemd 模式: systemctl restart mmw-agent"
-    systemctl restart mmw-agent
+    if ! systemctl restart mmw-agent; then
+        if [ -n "$BAK" ] && [ -f "$BAK" ]; then mv -f "$BAK" "$BIN"; fi
+        rollback_guard
+        systemctl restart mmw-agent >/dev/null 2>&1 || true
+        err "Agent 重启失败，已恢复旧 Agent、Guard 与调用方清单"
+    fi
     restarted=1
 elif command -v rc-service >/dev/null 2>&1 \
      && rc-service --exists mmw-agent 2>/dev/null; then
@@ -274,15 +307,18 @@ fi
 # 7. 验证
 sleep 3
 if [ $restarted -eq 1 ]; then
-    if pgrep -f "/usr/local/bin/mmw-agent" >/dev/null 2>&1; then
-        log "✅ 升级完成,agent 正在运行"
-    else
-        log "[ERROR] agent 进程未起来,查看 journalctl -u mmw-agent / /var/log/mmw-agent.log 排查"
-        if [ -n "$BAK" ]; then
-            log "[ERROR] 回滚命令: mv $BAK $BIN && systemctl restart mmw-agent"
-        fi
-        exit 1
+    if ! systemctl is-active --quiet mmw-agent || \
+       ! "$BIN" __guard-health /run/mmwx-guard-agent/guard.sock >/dev/null 2>&1; then
+        log "[ERROR] Agent/Guard 联合启动验证失败，正在成套回滚"
+        systemctl stop mmw-agent >/dev/null 2>&1 || true
+        if [ -n "$BAK" ] && [ -f "$BAK" ]; then mv -f "$BAK" "$BIN"; fi
+        rollback_guard
+        systemctl restart mmw-agent >/dev/null 2>&1 || true
+        err "升级失败，已恢复旧 Agent、Guard 与调用方清单"
     fi
+    log "✅ 升级完成，Agent 正在运行且 Guard 加密会话验证通过"
 fi
 
+rm -f "$BAK" "$GUARD_BAK" "$MANIFEST_BAK" "$GUARD_UNIT_BAK" "$AGENT_DROPIN_BAK"
+trap - EXIT
 log "done"

@@ -6,11 +6,9 @@ package guardbootstrap
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"mmw-agent/internal/guardclient"
 	"mmw-agent/internal/selfupdate"
 )
 
@@ -40,6 +39,7 @@ type Config struct {
 	DownloadBases []string
 	HTTPClient    *http.Client
 	Verify        func(string, string) error
+	VerifyHealth  func(context.Context, string) error
 	RunSystemctl  func(context.Context, ...string) error
 	WaitForSocket func(context.Context, string) error
 }
@@ -57,6 +57,7 @@ func EnsureDefault(ctx context.Context) error {
 		DownloadBases: defaultDownloadBases(),
 		HTTPClient:    &http.Client{Timeout: 3 * time.Minute},
 		Verify:        selfupdate.VerifyFile,
+		VerifyHealth:  verifyAgentGuardHealth,
 		RunSystemctl: func(ctx context.Context, args ...string) error {
 			cmd := exec.CommandContext(ctx, "systemctl", args...)
 			if output, err := cmd.CombinedOutput(); err != nil {
@@ -99,7 +100,7 @@ func Ensure(ctx context.Context, cfg Config) error {
 		return errors.New("incomplete Agent Guard bootstrap configuration")
 	}
 
-	name := "mmwx-guardd-linux-" + runtime.GOARCH
+	name := "mmwx-guardd-agent-linux-" + runtime.GOARCH
 	tmpDir, err := os.MkdirTemp("", "mmwx-guard-bootstrap-*")
 	if err != nil {
 		return err
@@ -175,7 +176,11 @@ func Ensure(ctx context.Context, cfg Config) error {
 		}
 		return fmt.Errorf("Agent Guard did not become ready: %w", err)
 	}
-	if err := verifyAgentGuardHealth(ctx, cfg.SocketPath); err != nil {
+	verifyHealth := cfg.VerifyHealth
+	if verifyHealth == nil {
+		verifyHealth = verifyAgentGuardHealth
+	}
+	if err := verifyHealth(ctx, cfg.SocketPath); err != nil {
 		rollback()
 		if hadBinary {
 			_ = cfg.RunSystemctl(context.Background(), "restart", guardServiceName)
@@ -187,28 +192,8 @@ func Ensure(ctx context.Context, cfg Config) error {
 }
 
 func verifyAgentGuardHealth(ctx context.Context, socket string) error {
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, "unix", socket)
-	}}
-	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/v1/health", nil)
+	health, err := guardclient.NewForSocket(socket).Health(ctx)
 	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	var health struct {
-		OK             bool   `json:"ok"`
-		Role           string `json:"role"`
-		CallerVerified bool   `json:"caller_verified"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&health); err != nil {
 		return err
 	}
 	if !health.OK || health.Role != "agent" || !health.CallerVerified {
@@ -380,7 +365,6 @@ Requires=%s
 After=%s
 
 [Service]
-Environment="MMWX_ACTION_GUARD=required"
 Environment="MMWX_GUARD_SOCKET=%s"
 `, guardServiceName, guardServiceName, cfg.SocketPath)
 	if err := os.WriteFile(filepath.Join(dropinDir, "action-guard.conf"), []byte(dropin), 0o644); err != nil {
