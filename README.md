@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.5.2 (2026-08-15)
+- 🛠️ fix: nat机启动失败
+- 🛠️ fix: 主控与agent同机guard冲突
+
 ### v0.5.1 (2026-08-15)
 - 🛠️ fix: nat机启动失败
 
