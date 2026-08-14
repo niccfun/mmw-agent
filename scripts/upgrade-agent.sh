@@ -43,7 +43,7 @@ log "架构: $ARCH_NAME"
 if [ "$TARGET" = "latest" ]; then
     PATH_SUFFIX="releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
     GUARD_PATH_SUFFIX="releases/latest/download/mmwx-guardd-agent-linux-${ARCH_NAME}"
-    log "目标: GitHub latest"
+    log "目标: latest（R2 CDN 优先，GitHub 回退）"
 else
     # 允许带或不带 v 前缀
     case "$TARGET" in v*) TAG="$TARGET" ;; *) TAG="v$TARGET" ;; esac
@@ -53,10 +53,15 @@ else
 fi
 
 # 3. 下载到临时位置(--max-time 防止网络卡死无限等)
-# 镜像链 — GitHub 优先,失败再自动降级到 CDN 代理。纯 v6 机器直连 github 会"network is unreachable"
-# (release binary 重定向到无 AAAA 的 objects.githubusercontent.com),会快速失败后降级到
-# gh-proxy 反代兜底。
+# latest 使用 R2 CDN 第一优先，避免批量升级集中请求 GitHub。指定历史版本时
+# 使用不可变 CDN 路径；老版本尚未回填时自动回退 GitHub。
+if [ "$TARGET" = "latest" ]; then
+    CDN_AGENT_URL="https://dl.miaomiaowux.com/mmw-agent/mmw-agent-linux-${ARCH_NAME}"
+else
+    CDN_AGENT_URL="https://dl.miaomiaowux.com/mmw-agent/releases/${TAG}/mmw-agent-linux-${ARCH_NAME}"
+fi
 MIRRORS=(
+    "$CDN_AGENT_URL"
     "https://github.com/${REPO}/${PATH_SUFFIX}"
     "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
 )
@@ -76,19 +81,31 @@ if [ -n "$GUARD_DOWNLOAD_BASE" ]; then
     fi
     GUARD_MIRRORS=("$guard_asset_base/mmwx-guardd-agent-linux-${ARCH_NAME}")
 fi
-TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
-GUARD_TMP="$(mktemp /tmp/mmwx-guardd-new.XXXXXX)"
-MANIFEST_TMP="$(mktemp /tmp/mmw-agent-new-manifest.XXXXXX)"
+# 不使用 /tmp：部分系统将其设为 noexec，磁盘或 tmpfs 过小时 curl 还会以
+# code 23 失败。专用目录同时容纳 Agent、Guard、签名和回滚工作空间。
+STAGING_DIR="/var/lib/mmw-agent-update"
+mkdir -p "$STAGING_DIR"
+chmod 0700 "$STAGING_DIR"
+AVAILABLE_KB=$(df -Pk "$STAGING_DIR" | awk 'NR==2 {print $4}')
+case "$AVAILABLE_KB" in ''|*[!0-9]*) err "无法检查升级暂存目录可用空间: $STAGING_DIR" ;; esac
+[ "$AVAILABLE_KB" -ge 131072 ] || err "升级暂存空间不足: $STAGING_DIR 仅剩 $((AVAILABLE_KB / 1024)) MB，至少需要 128 MB"
+TMP="$(mktemp "$STAGING_DIR/mmw-agent-new.XXXXXX")"
+GUARD_TMP="$(mktemp "$STAGING_DIR/mmwx-guardd-new.XXXXXX")"
+MANIFEST_TMP="$(mktemp "$STAGING_DIR/mmw-agent-new-manifest.XXXXXX")"
 trap 'rm -f "$TMP" "$TMP.sig" "$GUARD_TMP" "$GUARD_TMP.sig" "$MANIFEST_TMP"' EXIT
 download_ok=0
 for URL in "${MIRRORS[@]}"; do
     log "下载 $URL ..."
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --connect-timeout 10 --max-time 180 -o "$TMP" "$URL"; then
+        if curl -fsSL --connect-timeout 10 --max-time 180 -o "$TMP" "$URL" && \
+           curl -fsSL --connect-timeout 10 --max-time 60 -o "$TMP.sig" "${URL}.sig" && \
+           curl -fsSL --connect-timeout 10 --max-time 60 -o "$MANIFEST_TMP" "${URL}.manifest"; then
             download_ok=1; break
         fi
     elif command -v wget >/dev/null 2>&1; then
-        if wget -q --connect-timeout=10 --read-timeout=180 -O "$TMP" "$URL"; then
+        if wget -q --connect-timeout=10 --read-timeout=180 -O "$TMP" "$URL" && \
+           wget -q --connect-timeout=10 --read-timeout=60 -O "$TMP.sig" "${URL}.sig" && \
+           wget -q --connect-timeout=10 --read-timeout=60 -O "$MANIFEST_TMP" "${URL}.manifest"; then
             download_ok=1; break
         fi
     else
@@ -96,25 +113,18 @@ for URL in "${MIRRORS[@]}"; do
     fi
     log "  → 该镜像失败,尝试下一个..."
 done
-[ "$download_ok" = "1" ] || err "所有镜像均下载失败(GitHub + gh-proxy 全部不可达)"
+[ "$download_ok" = "1" ] || err "所有镜像均下载失败(CDN + GitHub + gh-proxy 均不可用；若出现 curl (23)，请检查磁盘空间和目录写权限)"
 SIZE=$(du -h "$TMP" | cut -f1)
 NEW_MD5=$(md5sum "$TMP" | awk '{print $1}')
 log "下载完成: $SIZE, md5=$NEW_MD5"
 
-# 3b. 签名校验:下载同名 .sig,用【已装】agent 的内嵌公钥验签(私钥离线,主控/本仓库都没有)。
+# 3b. 签名校验:二进制、.sig 和 manifest 已从同一镜像取得，避免 CDN 发布
+#     切换期间混用不同版本。用【已装】agent 的内嵌公钥验签。
 #     - rc=0  通过 → 继续
 #     - rc=1  新版 agent 明确判定签名不匹配 → 中止(防被篡改/MITM 的二进制)
 #     - 其它  当前是旧版 agent(不支持 __verify-update)或拿不到 .sig → 警告后继续(过渡期兼容)
 SIG="$TMP.sig"
-sig_ok=0
-for URL in "${MIRRORS[@]}"; do
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 10 --max-time 60 -o "$SIG" "${URL}.sig" && { sig_ok=1; break; }
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q --connect-timeout=10 --read-timeout=60 -O "$SIG" "${URL}.sig" && { sig_ok=1; break; }
-    fi
-done
-if [ "$sig_ok" = 1 ] && [ -x "$BIN" ] && command -v timeout >/dev/null 2>&1; then
+if [ -s "$SIG" ] && [ -x "$BIN" ] && command -v timeout >/dev/null 2>&1; then
     log "校验签名..."
     set +e
     VOUT=$(timeout 15 "$BIN" __verify-update "$TMP" "$SIG" 2>&1); VRC=$?
@@ -150,15 +160,6 @@ done
 if ! "$BIN" __verify-update "$GUARD_TMP" "$GUARD_TMP.sig"; then
     err "Agent Guard 签名校验失败，未替换任何二进制"
 fi
-manifest_download_ok=0
-for URL in "${MIRRORS[@]}"; do
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --connect-timeout 10 --max-time 60 -o "$MANIFEST_TMP" "${URL}.manifest" && { manifest_download_ok=1; break; }
-    else
-        wget -q --connect-timeout=10 --read-timeout=60 -O "$MANIFEST_TMP" "${URL}.manifest" && { manifest_download_ok=1; break; }
-    fi
-done
-[ "$manifest_download_ok" = "1" ] || err "Agent 发布签名清单下载失败，未替换任何二进制"
 chmod 0755 "$TMP" "$GUARD_TMP"
 if ! "$GUARD_TMP" --role agent --manifest "$MANIFEST_TMP" --verify-manifest-for "$TMP"; then
     err "Agent 二进制与官方签名清单不匹配，未替换任何二进制"

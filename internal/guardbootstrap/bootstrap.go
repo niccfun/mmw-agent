@@ -19,6 +19,7 @@ import (
 
 	"mmw-agent/internal/guardclient"
 	"mmw-agent/internal/selfupdate"
+	"mmw-agent/internal/version"
 )
 
 const (
@@ -43,6 +44,10 @@ type Config struct {
 	OpenRCDir     string
 	InitSystem    string
 	DownloadBases []string
+	ManifestBases []string
+	TempDir       string
+	Now           func() time.Time
+	StaleMaxAge   time.Duration
 	HTTPClient    *http.Client
 	Verify        func(string, string) error
 	VerifyHealth  func(context.Context, string) error
@@ -80,6 +85,7 @@ func EnsureDefault(ctx context.Context) error {
 		OpenRCDir:     defaultOpenRCDir,
 		InitSystem:    initSystem,
 		DownloadBases: defaultDownloadBases(),
+		ManifestBases: releaseManifestBases(version.Version),
 		HTTPClient:    &http.Client{Timeout: 3 * time.Minute},
 		Verify:        selfupdate.VerifyFile,
 		VerifyHealth:  verifyAgentGuardHealth,
@@ -103,6 +109,23 @@ func EnsureDefault(ctx context.Context) error {
 }
 
 func Ensure(ctx context.Context, cfg Config) error {
+	tempDir := cfg.TempDir
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
+	now := time.Now
+	if cfg.Now != nil {
+		now = cfg.Now
+	}
+	staleMaxAge := cfg.StaleMaxAge
+	if staleMaxAge <= 0 {
+		staleMaxAge = 30 * time.Minute
+	}
+	// A previous process can be killed by its service manager while bootstrapping
+	// Guard, so Go defers are not guaranteed to run. Bound disk usage before any
+	// health/download work without touching a currently active bootstrap dir.
+	cleanupErr := cleanupStaleBootstrapDirs(tempDir, now(), staleMaxAge)
+
 	initSystem := cfg.InitSystem
 	if initSystem == "" {
 		// Preserve the systemd default for tests and callers created before
@@ -126,6 +149,9 @@ func Ensure(ctx context.Context, cfg Config) error {
 		if err == nil && verifyHealth(ctx, cfg.SocketPath) == nil {
 			return nil
 		}
+	}
+	if cleanupErr != nil {
+		return fmt.Errorf("cleanup stale Agent Guard bootstrap directories: %w", cleanupErr)
 	}
 	if runtime.GOOS != "linux" || (runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64") {
 		return fmt.Errorf("Agent Guard does not support %s/%s", runtime.GOOS, runtime.GOARCH)
@@ -151,7 +177,7 @@ func Ensure(ctx context.Context, cfg Config) error {
 	}
 
 	name := "mmwx-guardd-agent-linux-" + runtime.GOARCH
-	tmpDir, err := os.MkdirTemp("", "mmwx-guard-bootstrap-*")
+	tmpDir, err := os.MkdirTemp(tempDir, "mmwx-guard-bootstrap-*")
 	if err != nil {
 		return err
 	}
@@ -162,7 +188,11 @@ func Ensure(ctx context.Context, cfg Config) error {
 	if err := downloadSignedPair(ctx, cfg.HTTPClient, cfg.DownloadBases, name, binTmp, sigTmp, cfg.Verify); err != nil {
 		return err
 	}
-	if err := downloadFromBases(ctx, cfg.HTTPClient, cfg.DownloadBases, "mmw-agent-linux-"+runtime.GOARCH+".manifest", manifestTmp, 64<<10); err != nil {
+	manifestBases := cfg.ManifestBases
+	if len(manifestBases) == 0 {
+		manifestBases = cfg.DownloadBases
+	}
+	if err := downloadFromBases(ctx, cfg.HTTPClient, manifestBases, "mmw-agent-linux-"+runtime.GOARCH+".manifest", manifestTmp, 64<<10); err != nil {
 		return fmt.Errorf("download signed Agent release manifest: %w", err)
 	}
 	if err := os.Chmod(binTmp, 0o755); err != nil {
@@ -230,6 +260,26 @@ func Ensure(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("Agent Guard health check failed: %w", err)
 	}
 	_ = os.Remove(backupPath)
+	return nil
+}
+
+func cleanupStaleBootstrapDirs(root string, now time.Time, maxAge time.Duration) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "mmwx-guard-bootstrap-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < maxAge {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -303,6 +353,22 @@ func defaultDownloadBases() []string {
 		result = append(result, value)
 	}
 	return result
+}
+
+// releaseManifestBases returns immutable locations for the manifest matching
+// the Agent binary that is currently executing. Using the mutable "latest"
+// manifest can never repair an older Agent: Guard correctly rejects its hash,
+// causing an endless bootstrap/restart loop.
+func releaseManifestBases(agentVersion string) []string {
+	tag := strings.TrimSpace(agentVersion)
+	if !strings.HasPrefix(tag, "v") {
+		tag = "v" + tag
+	}
+	return []string{
+		"https://dl.miaomiaowux.com/mmw-agent/releases/" + tag,
+		"https://github.com/iluobei/mmw-agent/releases/download/" + tag,
+		"https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/download/" + tag,
+	}
 }
 
 func downloadSignedPair(ctx context.Context, client *http.Client, bases []string, name, binPath, sigPath string, verify func(string, string) error) error {

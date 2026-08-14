@@ -84,7 +84,11 @@ jobs:
             aws s3 cp "$f" "s3://$BUCKET/$PROJECT/$name" \
               --endpoint-url "$R2_ENDPOINT" \
               --content-type application/octet-stream \
-              --cache-control "public, max-age=86400"
+              --cache-control "public, max-age=60, must-revalidate"
+            aws s3 cp "$f" "s3://$BUCKET/$PROJECT/releases/$TAG/$name" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --content-type application/octet-stream \
+              --cache-control "public, max-age=31536000, immutable"
           done
           aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/version.json" \
             --endpoint-url "$R2_ENDPOINT" \

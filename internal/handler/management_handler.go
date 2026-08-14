@@ -5598,19 +5598,33 @@ case $ARCH in
 esac
 
 cleanup_upgrade_files() {
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig /tmp/mmw-agent-new.manifest
+    rm -rf "$STAGING_DIR"
 }
-trap cleanup_upgrade_files EXIT
 
 if [ "${DOCKER:-0}" = "1" ] || [ -f /.dockerenv ]; then
     echo "ERROR: Docker Agent 必须更新容器镜像，不能在容器内替换 Agent/Guard" >&2
     exit 1
 fi
-# 镜像链 — 顺序尝试,任一成功即停。GitHub 优先,失败再自动降级到 CDN 代理。
-# 注:GitHub Release binary 实际重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
-# 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 会快速失败(近乎即时,
-# 非超时)后降级到 gh-proxy 反代。
+# 镜像链按 R2 CDN → GitHub → GitHub 代理依次尝试。二进制、签名和 manifest
+# 必须从同一个镜像同时取得，避免发布切换期间混用不同版本。
+mkdir -p /var/lib/mmw-agent-update
+chmod 0700 /var/lib/mmw-agent-update
+STAGING_DIR=$(mktemp -d /var/lib/mmw-agent-update/in-process.XXXXXX)
+chmod 0700 "$STAGING_DIR"
+AGENT_NEW="$STAGING_DIR/mmw-agent-new"
+AGENT_SIG="$STAGING_DIR/mmw-agent-new.sig"
+GUARD_NEW="$STAGING_DIR/mmwx-guardd-new"
+GUARD_SIG="$STAGING_DIR/mmwx-guardd-new.sig"
+MANIFEST_NEW="$STAGING_DIR/mmw-agent-new.manifest"
+AVAILABLE_KB=$(df -Pk "$STAGING_DIR" | awk 'NR==2 {print $4}')
+case "$AVAILABLE_KB" in ''|*[!0-9]*) echo "ERROR: 无法检查升级暂存空间" >&2; exit 1 ;; esac
+if [ "$AVAILABLE_KB" -lt 131072 ]; then
+    echo "ERROR: 升级暂存空间不足，仅剩 $((AVAILABLE_KB / 1024)) MB，至少需要 128 MB" >&2
+    exit 1
+fi
+trap cleanup_upgrade_files EXIT
 MIRRORS=(
+    "https://dl.miaomiaowux.com/mmw-agent/mmw-agent-linux-${ARCH_NAME}"
     "https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
     "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 )
@@ -5653,7 +5667,7 @@ dl() { # dl <url> <outfile>
 download_ok=0
 for url in "${MIRRORS[@]}"; do
     echo "Downloading from $url ..."
-    if dl "$url" /tmp/mmw-agent-new && dl "${url}.sig" /tmp/mmw-agent-new.sig; then
+    if dl "$url" "$AGENT_NEW" && dl "${url}.sig" "$AGENT_SIG" && dl "${url}.manifest" "$MANIFEST_NEW"; then
         download_ok=1
         break
     fi
@@ -5668,8 +5682,8 @@ guard_download_ok=0
 SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
 for url in "${GUARD_MIRRORS[@]}"; do
     echo "Downloading Agent Guard from $url ..."
-    if dl "$url" /tmp/mmwx-guardd-new && dl "${url}.sig" /tmp/mmwx-guardd-new.sig && \
-       "$SELF_BIN" __verify-update /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig; then
+    if dl "$url" "$GUARD_NEW" && dl "${url}.sig" "$GUARD_SIG" && \
+       "$SELF_BIN" __verify-update "$GUARD_NEW" "$GUARD_SIG"; then
         guard_download_ok=1
         break
     fi
@@ -5677,41 +5691,30 @@ for url in "${GUARD_MIRRORS[@]}"; do
 done
 if [ "$guard_download_ok" != "1" ]; then
     echo "ERROR: Agent Guard 或签名下载失败；现有 Agent/Guard 均未改动" >&2
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig
     exit 1
 fi
 
-chmod +x /tmp/mmw-agent-new
-echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
+chmod +x "$AGENT_NEW"
+echo "Download complete, binary size: $(du -h "$AGENT_NEW" | cut -f1)"
 
 # 签名校验:用【当前正在运行】的 agent 内嵌公钥校验新二进制,通过才替换。
 # 私钥离线(GitHub secret / 本地未提交脚本),主控与本仓库都没有 → 主控被攻破也签不出能过校验的二进制。
 echo "Verifying signature ..."
-if ! "$SELF_BIN" __verify-update /tmp/mmw-agent-new /tmp/mmw-agent-new.sig; then
+if ! "$SELF_BIN" __verify-update "$AGENT_NEW" "$AGENT_SIG"; then
     echo "ERROR: 升级二进制签名校验失败,已拒绝替换" >&2
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig
     exit 1
 fi
 echo "Signature OK."
 
 echo "Verifying Agent Guard signature ..."
-if ! "$SELF_BIN" __verify-update /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig; then
+if ! "$SELF_BIN" __verify-update "$GUARD_NEW" "$GUARD_SIG"; then
     echo "ERROR: Agent Guard 签名校验失败，现有 Agent/Guard 均未改动" >&2
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new /tmp/mmwx-guardd-new.sig
     exit 1
 fi
 echo "Agent Guard signature OK."
 
-manifest_download_ok=0
-for url in "${MIRRORS[@]}"; do
-    if dl "${url}.manifest" /tmp/mmw-agent-new.manifest; then manifest_download_ok=1; break; fi
-done
-if [ "$manifest_download_ok" != "1" ]; then
-    echo "ERROR: Agent 发布签名清单下载失败，现有 Agent/Guard 均未改动" >&2
-    exit 1
-fi
-chmod 0755 /tmp/mmwx-guardd-new
-if ! /tmp/mmwx-guardd-new --role agent --manifest /tmp/mmw-agent-new.manifest --verify-manifest-for /tmp/mmw-agent-new; then
+chmod 0755 "$GUARD_NEW"
+if ! "$GUARD_NEW" --role agent --manifest "$MANIFEST_NEW" --verify-manifest-for "$AGENT_NEW"; then
     echo "ERROR: Agent 二进制与官方签名清单不匹配，现有 Agent/Guard 均未改动" >&2
     exit 1
 fi
@@ -5747,7 +5750,7 @@ AGENT_DROPIN_HAD_OLD=0
 if [ -f "$MANIFEST_PATH" ]; then cp -p "$MANIFEST_PATH" "$MANIFEST_BAK"; MANIFEST_HAD_OLD=1; else rm -f "$MANIFEST_BAK"; fi
 if [ -f "$GUARD_UNIT" ]; then cp -p "$GUARD_UNIT" "$GUARD_UNIT_BAK"; GUARD_UNIT_HAD_OLD=1; else rm -f "$GUARD_UNIT_BAK"; fi
 if [ -f "$AGENT_DROPIN" ]; then cp -p "$AGENT_DROPIN" "$AGENT_DROPIN_BAK"; AGENT_DROPIN_HAD_OLD=1; else rm -f "$AGENT_DROPIN_BAK"; fi
-install -m 0644 /tmp/mmw-agent-new.manifest /usr/local/share/mmwx-guard/agent.manifest
+install -m 0644 "$MANIFEST_NEW" /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
 if [ "$HAS_SYSTEMD" = "1" ]; then
 mkdir -p /etc/systemd/system/mmw-agent.service.d
@@ -5866,8 +5869,8 @@ rollback_guard() {
         fi
     fi
 }
-chmod 0755 /tmp/mmwx-guardd-new
-mv -f /tmp/mmwx-guardd-new "$GUARD_BIN.new"
+chmod 0755 "$GUARD_NEW"
+mv -f "$GUARD_NEW" "$GUARD_BIN.new"
 mv -f "$GUARD_BIN.new" "$GUARD_BIN"
 guard_start_ok=0
 if [ "$HAS_SYSTEMD" = "1" ]; then
@@ -5882,7 +5885,6 @@ fi
 if [ "$guard_start_ok" != "1" ]; then
     echo "ERROR: Agent Guard 启动失败，正在回滚" >&2
     rollback_guard
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new.sig
     exit 1
 fi
 guard_ready=0
@@ -5893,10 +5895,8 @@ done
 if [ "$guard_ready" != "1" ]; then
     echo "ERROR: Agent Guard socket 未就绪，正在回滚" >&2
     rollback_guard
-    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new.sig
     exit 1
 fi
-rm -f /tmp/mmwx-guardd-new.sig
 echo "Guard replaced; exact caller manifest verified; identity and lease state preserved."
 
 # 替换二进制；完成后 agent 会原地 exec 新版本，不依赖特定 init 系统。
@@ -5906,7 +5906,7 @@ echo "Guard replaced; exact caller manifest verified; identity and lease state p
 AGENT_BIN=/usr/local/bin/mmw-agent
 AGENT_BAK=/usr/local/bin/mmw-agent.upgrade-backup
 cp -p "$AGENT_BIN" "$AGENT_BAK"
-if ! cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new || \
+if ! cp "$AGENT_NEW" /usr/local/bin/mmw-agent.new || \
    ! chmod +x /usr/local/bin/mmw-agent.new || \
    ! mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent; then
     echo "ERROR: Agent 替换失败，正在回滚 Agent Guard" >&2
@@ -5923,8 +5923,8 @@ if ! "$AGENT_BIN" __guard-health /run/mmwx-guard-agent/guard.sock >/dev/null 2>&
 fi
 rm -f "$AGENT_BAK"
 rm -f "$GUARD_BAK" "$MANIFEST_BAK" "$GUARD_UNIT_BAK" "$AGENT_DROPIN_BAK"
-rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig
 trap - EXIT
+cleanup_upgrade_files
 echo "Binary replaced; Agent and Guard upgraded; agent will self-exec the new version."
 `
 	// 整个升级流程兜底超时 5 分钟 — 包括 GitHub 下载、二进制写入、SSE 流。

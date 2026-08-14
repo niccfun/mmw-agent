@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDownloadSignedPairFallsBackAfterSignatureVerificationFailure(t *testing.T) {
@@ -46,6 +47,51 @@ func TestDownloadSignedPairFallsBackAfterSignatureVerificationFailure(t *testing
 	}
 	if got, _ := os.ReadFile(binPath); string(got) != "good-guard" {
 		t.Fatalf("fallback binary = %q", got)
+	}
+}
+
+func TestReleaseManifestBasesArePinnedToRunningAgentVersion(t *testing.T) {
+	bases := releaseManifestBases("0.5.1")
+	if len(bases) < 2 {
+		t.Fatalf("manifest bases = %#v", bases)
+	}
+	for _, base := range bases {
+		if !strings.Contains(base, "v0.5.1") || strings.Contains(base, "/latest/") {
+			t.Fatalf("manifest base is not immutable: %q", base)
+		}
+	}
+}
+
+func TestCleanupStaleBootstrapDirsPreservesRecentAndUnrelatedEntries(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	stale := filepath.Join(root, "mmwx-guard-bootstrap-stale")
+	recent := filepath.Join(root, "mmwx-guard-bootstrap-active")
+	unrelated := filepath.Join(root, "another-temp-dir")
+	for _, path := range []string{stale, recent, unrelated} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chtimes(stale, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(recent, now.Add(-5*time.Minute), now.Add(-5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(unrelated, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupStaleBootstrapDirs(root, now, 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale bootstrap directory still exists: %v", err)
+	}
+	for _, path := range []string{recent, unrelated} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved directory %s: %v", path, err)
+		}
 	}
 }
 
