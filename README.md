@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.5.5 (2026-08-15)
+- 🛠️ fix: agent guard升级失败
+- 🛠️ fix: agent一键升级失败
+
 ### v0.5.4 (2026-08-15)
 - 🛠️ fix: agent一键升级失败
 
