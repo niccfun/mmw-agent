@@ -49,6 +49,19 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.5.0 (2026-08-15)
+- 🌈 agent更新、安装优先走cf cdn
+- 🌈 套餐支持拼车发布
+- 🛠️ Guard自举固定优先使用R2
+- 🛠️ fix: agent卸载失败
+- 🛠️ fix: 保留旧 Agent Guard 启动参数
+- 🛠️ 修复测试包校验清单生成
+- 🛠️ 修复测试包签名工具路径
+- 🛠️ 修复跨架构测试包验签
+- 🛡️ feat: Agent 强制接入加密 Guard
+- 🧪 修正测试包校验清单路径
+- 🧪 增加签名测试包构建
+
 ### v0.4.9 (2026-08-10)
 - 🌈 rc-service启动失败
 - 🌈 ws连接不稳定的适合反复重启
