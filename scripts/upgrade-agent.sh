@@ -243,6 +243,12 @@ After=mmwx-guard-agent.service
 [Service]
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
+# v0.5.3 等旧安装器把 Guard 写进了主 unit 的 Requires=。drop-in 的
+# Wants= 不会覆盖它，重启 Guard 仍会级联停止正在执行升级的 Agent。
+# 在 daemon-reload 前清理这个遗留强依赖，只保留上面的软依赖与顺序。
+if [ -f /etc/systemd/system/mmw-agent.service ]; then
+    sed -i 's/^Requires=mmwx-guard-agent\.service$/Wants=mmwx-guard-agent.service/' /etc/systemd/system/mmw-agent.service
+fi
 else
 cat > /etc/init.d/mmwx-guard-agent <<'EOF'
 #!/sbin/openrc-run
@@ -279,22 +285,22 @@ rollback_guard() {
         rc-service -D mmwx-guard-agent stop >/dev/null 2>&1 || true
     fi
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
-        mv -f "$GUARD_BAK" "$GUARD_BIN"
+        cp -p "$GUARD_BAK" "$GUARD_BIN"
     else
         rm -f "$GUARD_BIN"
     fi
     if [ "$MANIFEST_HAD_OLD" = "1" ] && [ -f "$MANIFEST_BAK" ]; then
-        mv -f "$MANIFEST_BAK" /usr/local/share/mmwx-guard/agent.manifest
+        cp -p "$MANIFEST_BAK" /usr/local/share/mmwx-guard/agent.manifest
     else
         rm -f /usr/local/share/mmwx-guard/agent.manifest
     fi
-    if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then mv -f "$GUARD_UNIT_BAK" "$GUARD_UNIT"; else rm -f "$GUARD_UNIT"; fi
+    if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then cp -p "$GUARD_UNIT_BAK" "$GUARD_UNIT"; else rm -f "$GUARD_UNIT"; fi
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         # Keep Wants= so restarting the restored Guard cannot kill the Agent or
         # this rollback transaction through an old Requires= dependency.
         rm -f "$AGENT_DROPIN_BAK"
     elif [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then
-        mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
+        cp -p "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
     else
         rm -f "$AGENT_DROPIN"
     fi
@@ -353,7 +359,7 @@ restarted=0
 if [ "$INIT_SYSTEM" = "systemd" ]; then
     log "systemd 模式: systemctl restart mmw-agent"
     if ! systemctl restart mmw-agent; then
-        if [ -n "$BAK" ] && [ -f "$BAK" ]; then mv -f "$BAK" "$BIN"; fi
+        if [ -n "$BAK" ] && [ -f "$BAK" ]; then cp -p "$BAK" "$BIN"; fi
         rollback_guard
         systemctl restart mmw-agent >/dev/null 2>&1 || true
         err "Agent 重启失败，已恢复旧 Agent、Guard 与调用方清单"
@@ -388,7 +394,7 @@ if [ $restarted -eq 1 ]; then
         else
             rc-service mmw-agent stop >/dev/null 2>&1 || true
         fi
-        if [ -n "$BAK" ] && [ -f "$BAK" ]; then mv -f "$BAK" "$BIN"; fi
+        if [ -n "$BAK" ] && [ -f "$BAK" ]; then cp -p "$BAK" "$BIN"; fi
         rollback_guard
         if [ "$INIT_SYSTEM" = "systemd" ]; then
             systemctl restart mmw-agent >/dev/null 2>&1 || true

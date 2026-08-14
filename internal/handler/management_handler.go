@@ -5784,6 +5784,9 @@ After=mmwx-guard-agent.service
 [Service]
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
+if [ -f /etc/systemd/system/mmw-agent.service ]; then
+    sed -i 's/^Requires=mmwx-guard-agent\.service$/Wants=mmwx-guard-agent.service/' /etc/systemd/system/mmw-agent.service
+fi
 else
 cat > /etc/init.d/mmwx-guard-agent <<'EOF'
 #!/sbin/openrc-run
@@ -5828,17 +5831,17 @@ rollback_guard() {
         rc-service -D mmwx-guard-agent stop >/dev/null 2>&1 || true
     fi
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
-        mv -f "$GUARD_BAK" "$GUARD_BIN"
+        cp -p "$GUARD_BAK" "$GUARD_BIN"
     else
         rm -f "$GUARD_BIN"
     fi
     if [ "$MANIFEST_HAD_OLD" = "1" ] && [ -f "$MANIFEST_BAK" ]; then
-        mv -f "$MANIFEST_BAK" "$MANIFEST_PATH"
+        cp -p "$MANIFEST_BAK" "$MANIFEST_PATH"
     else
         rm -f "$MANIFEST_PATH"
     fi
     if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then
-        mv -f "$GUARD_UNIT_BAK" "$GUARD_UNIT"
+        cp -p "$GUARD_UNIT_BAK" "$GUARD_UNIT"
     else
         rm -f "$GUARD_UNIT"
     fi
@@ -5848,7 +5851,7 @@ rollback_guard() {
         # cascade-stop this Agent and interrupt rollback itself.
         rm -f "$AGENT_DROPIN_BAK"
     elif [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then
-        mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
+        cp -p "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
     else
         rm -f "$AGENT_DROPIN"
     fi
@@ -5911,13 +5914,13 @@ if ! cp "$AGENT_NEW" /usr/local/bin/mmw-agent.new || \
    ! mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent; then
     echo "ERROR: Agent 替换失败，正在回滚 Agent Guard" >&2
     rm -f /usr/local/bin/mmw-agent.new
-    mv -f "$AGENT_BAK" "$AGENT_BIN"
+    cp -p "$AGENT_BAK" "$AGENT_BIN"
     rollback_guard
     exit 1
 fi
 if ! "$AGENT_BIN" __guard-health /run/mmwx-guard-agent/guard.sock >/dev/null 2>&1; then
     echo "ERROR: 新 Agent 与 Guard 加密会话验证失败，正在成套回滚" >&2
-    mv -f "$AGENT_BAK" "$AGENT_BIN"
+    cp -p "$AGENT_BAK" "$AGENT_BIN"
     rollback_guard
     exit 1
 fi

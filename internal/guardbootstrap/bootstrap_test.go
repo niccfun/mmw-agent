@@ -209,11 +209,18 @@ func TestEnsureRollsBackGuardWhenStartFails(t *testing.T) {
 	if err := os.WriteFile(bin, []byte("old-guard"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	manifestPath := filepath.Join(root, "share", "agent.manifest")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, []byte("old-manifest"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	cfg := Config{
 		SocketPath:    filepath.Join(root, "missing.sock"),
 		BinaryPath:    bin,
 		StateDir:      filepath.Join(root, "state"),
-		ManifestPath:  filepath.Join(root, "share", "agent.manifest"),
+		ManifestPath:  manifestPath,
 		SystemdDir:    filepath.Join(root, "systemd"),
 		DownloadBases: []string{server.URL},
 		HTTPClient:    server.Client(),
@@ -230,6 +237,10 @@ func TestEnsureRollsBackGuardWhenStartFails(t *testing.T) {
 	got, err := os.ReadFile(bin)
 	if err != nil || string(got) != "old-guard" {
 		t.Fatalf("Guard rollback failed: got=%q err=%v", got, err)
+	}
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil || string(manifest) != "old-manifest" {
+		t.Fatalf("manifest rollback failed: got=%q err=%v", manifest, err)
 	}
 }
 

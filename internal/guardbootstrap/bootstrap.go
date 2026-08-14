@@ -207,6 +207,9 @@ func Ensure(ctx context.Context, cfg Config) error {
 	if err := os.Chmod(cfg.StateDir, 0o700); err != nil {
 		return err
 	}
+	if cfg.ManifestPath == "" {
+		cfg.ManifestPath = defaultManifest
+	}
 	hadBinary := false
 	backupPath := ""
 	if _, err := os.Stat(cfg.BinaryPath); err == nil {
@@ -216,18 +219,33 @@ func Ensure(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("backup Agent Guard: %w", err)
 		}
 	}
+	hadManifest := false
+	manifestBackupPath := cfg.ManifestPath + ".bootstrap-backup"
+	if _, err := os.Stat(cfg.ManifestPath); err == nil {
+		hadManifest = true
+		if err := copyFile(cfg.ManifestPath, manifestBackupPath, 0o644); err != nil {
+			return fmt.Errorf("backup Agent manifest: %w", err)
+		}
+	} else {
+		_ = os.Remove(manifestBackupPath)
+	}
 	rollback := func() {
 		if hadBinary {
-			_ = os.Rename(backupPath, cfg.BinaryPath)
+			_ = copyFile(backupPath, cfg.BinaryPath, 0o755)
 		} else {
 			_ = os.Remove(cfg.BinaryPath)
 		}
+		if hadManifest {
+			_ = copyFile(manifestBackupPath, cfg.ManifestPath, 0o644)
+		} else {
+			_ = os.Remove(cfg.ManifestPath)
+		}
+		_ = os.Remove(backupPath)
+		_ = os.Remove(manifestBackupPath)
 	}
 	if err := installAtomic(binTmp, cfg.BinaryPath); err != nil {
+		rollback()
 		return fmt.Errorf("install Agent Guard: %w", err)
-	}
-	if cfg.ManifestPath == "" {
-		cfg.ManifestPath = defaultManifest
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.ManifestPath), 0o755); err != nil {
 		rollback()
@@ -260,6 +278,7 @@ func Ensure(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("Agent Guard health check failed: %w", err)
 	}
 	_ = os.Remove(backupPath)
+	_ = os.Remove(manifestBackupPath)
 	return nil
 }
 
