@@ -235,15 +235,13 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-if [ "$AGENT_DROPIN_HAD_OLD" != "1" ]; then
 cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 [Unit]
-Requires=mmwx-guard-agent.service
+Wants=mmwx-guard-agent.service
 After=mmwx-guard-agent.service
 [Service]
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
-fi
 else
 cat > /etc/init.d/mmwx-guard-agent <<'EOF'
 #!/sbin/openrc-run
@@ -277,7 +275,7 @@ rollback_guard() {
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         systemctl stop mmwx-guard-agent >/dev/null 2>&1 || true
     else
-        rc-service mmwx-guard-agent stop >/dev/null 2>&1 || true
+        rc-service -D mmwx-guard-agent stop >/dev/null 2>&1 || true
     fi
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
         mv -f "$GUARD_BAK" "$GUARD_BIN"
@@ -290,10 +288,18 @@ rollback_guard() {
         rm -f /usr/local/share/mmwx-guard/agent.manifest
     fi
     if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then mv -f "$GUARD_UNIT_BAK" "$GUARD_UNIT"; else rm -f "$GUARD_UNIT"; fi
-    if [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"; else rm -f "$AGENT_DROPIN"; fi
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        # Keep Wants= so restarting the restored Guard cannot kill the Agent or
+        # this rollback transaction through an old Requires= dependency.
+        rm -f "$AGENT_DROPIN_BAK"
+    elif [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then
+        mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
+    else
+        rm -f "$AGENT_DROPIN"
+    fi
     if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
     if [ "$GUARD_HAD_OLD" = "1" ]; then
-        if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true; else rc-service mmwx-guard-agent restart >/dev/null 2>&1 || true; fi
+        if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true; else rc-service -D mmwx-guard-agent restart >/dev/null 2>&1 || true; fi
     else
         if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl disable mmwx-guard-agent >/dev/null 2>&1 || true; else rc-update del mmwx-guard-agent default >/dev/null 2>&1 || true; fi
     fi
@@ -309,7 +315,7 @@ if [ "$INIT_SYSTEM" = "systemd" ]; then
     if systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 && systemctl restart mmwx-guard-agent; then guard_start_ok=1; fi
 else
     rc-update add mmwx-guard-agent default >/dev/null 2>&1 || true
-    if rc-service mmwx-guard-agent restart; then guard_start_ok=1; fi
+    if rc-service -D mmwx-guard-agent restart; then guard_start_ok=1; fi
 fi
 if [ "$guard_start_ok" != "1" ]; then
     rollback_guard

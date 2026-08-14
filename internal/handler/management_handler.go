@@ -5771,16 +5771,16 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-if [ ! -f /etc/systemd/system/mmw-agent.service.d/action-guard.conf ]; then
 cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 [Unit]
-Requires=mmwx-guard-agent.service
+# Keep startup ordering without propagating a maintenance restart of Guard back
+# into the Agent that is executing the atomic upgrade transaction.
+Wants=mmwx-guard-agent.service
 After=mmwx-guard-agent.service
 
 [Service]
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
-fi
 else
 cat > /etc/init.d/mmwx-guard-agent <<'EOF'
 #!/sbin/openrc-run
@@ -5819,7 +5819,10 @@ rollback_guard() {
     if [ "$HAS_SYSTEMD" = "1" ]; then
         systemctl stop mmwx-guard-agent >/dev/null 2>&1 || true
     else
-        rc-service mmwx-guard-agent stop >/dev/null 2>&1 || true
+        # -D/--nodeps is critical here. mmw-agent needs the Guard service, so a
+        # normal Guard stop/restart makes OpenRC stop mmw-agent first and kills
+        # this upgrade script together with its parent request.
+        rc-service -D mmwx-guard-agent stop >/dev/null 2>&1 || true
     fi
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
         mv -f "$GUARD_BAK" "$GUARD_BIN"
@@ -5836,7 +5839,12 @@ rollback_guard() {
     else
         rm -f "$GUARD_UNIT"
     fi
-    if [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        # Keep the normalized Wants= drop-in even when binaries roll back.
+        # Restoring an old Requires= here would make the Guard restart below
+        # cascade-stop this Agent and interrupt rollback itself.
+        rm -f "$AGENT_DROPIN_BAK"
+    elif [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then
         mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
     else
         rm -f "$AGENT_DROPIN"
@@ -5848,7 +5856,7 @@ rollback_guard() {
         if [ "$HAS_SYSTEMD" = "1" ]; then
             systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
         else
-            rc-service mmwx-guard-agent restart >/dev/null 2>&1 || true
+            rc-service -D mmwx-guard-agent restart >/dev/null 2>&1 || true
         fi
     else
         if [ "$HAS_SYSTEMD" = "1" ]; then
@@ -5867,7 +5875,9 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
     if systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 && systemctl restart mmwx-guard-agent; then guard_start_ok=1; fi
 else
     rc-update add mmwx-guard-agent default >/dev/null 2>&1 || true
-    if rc-service mmwx-guard-agent restart; then guard_start_ok=1; fi
+    # Do not cascade-stop the currently running Agent: this shell is a child of
+    # that Agent and must live long enough to replace/verify both binaries.
+    if rc-service -D mmwx-guard-agent restart; then guard_start_ok=1; fi
 fi
 if [ "$guard_start_ok" != "1" ]; then
     echo "ERROR: Agent Guard 启动失败，正在回滚" >&2
@@ -5893,14 +5903,25 @@ echo "Guard replaced; exact caller manifest verified; identity and lease state p
 # 直接 cp 到 /usr/local/bin/mmw-agent 会触发 "Text file busy",因为正在运行的 mmw-agent 进程占着该 inode。
 # 改成"先 cp 到旁路文件,再原子 mv 覆盖" — Linux rename(2) 不影响正在执行的进程映射的旧 inode,
 # 新 inode 接管该路径,旧 inode 直到进程退出才释放。
+AGENT_BIN=/usr/local/bin/mmw-agent
+AGENT_BAK=/usr/local/bin/mmw-agent.upgrade-backup
+cp -p "$AGENT_BIN" "$AGENT_BAK"
 if ! cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new || \
    ! chmod +x /usr/local/bin/mmw-agent.new || \
    ! mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent; then
     echo "ERROR: Agent 替换失败，正在回滚 Agent Guard" >&2
     rm -f /usr/local/bin/mmw-agent.new
+    mv -f "$AGENT_BAK" "$AGENT_BIN"
     rollback_guard
     exit 1
 fi
+if ! "$AGENT_BIN" __guard-health /run/mmwx-guard-agent/guard.sock >/dev/null 2>&1; then
+    echo "ERROR: 新 Agent 与 Guard 加密会话验证失败，正在成套回滚" >&2
+    mv -f "$AGENT_BAK" "$AGENT_BIN"
+    rollback_guard
+    exit 1
+fi
+rm -f "$AGENT_BAK"
 rm -f "$GUARD_BAK" "$MANIFEST_BAK" "$GUARD_UNIT_BAK" "$AGENT_DROPIN_BAK"
 rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig
 trap - EXIT

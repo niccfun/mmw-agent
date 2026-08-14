@@ -245,7 +245,11 @@ func startGuardService(ctx context.Context, cfg Config, initSystem string) error
 		if err := cfg.RunOpenRC(ctx, "rc-update", "add", guardOpenRCName, "default"); err != nil {
 			return err
 		}
-		return cfg.RunOpenRC(ctx, "rc-service", guardOpenRCName, "restart")
+		// mmw-agent declares a hard dependency on the Guard. A normal OpenRC
+		// restart cascades through reverse dependencies and kills the Agent that
+		// is currently performing this bootstrap/upgrade. --nodeps limits the
+		// operation to Guard; the caller verifies its socket before continuing.
+		return cfg.RunOpenRC(ctx, "rc-service", "--nodeps", guardOpenRCName, "restart")
 	}
 	if err := cfg.RunSystemctl(ctx, "daemon-reload"); err != nil {
 		return err
@@ -255,7 +259,7 @@ func startGuardService(ctx context.Context, cfg Config, initSystem string) error
 
 func restartGuardService(ctx context.Context, cfg Config, initSystem string) error {
 	if initSystem == initOpenRC {
-		return cfg.RunOpenRC(ctx, "rc-service", guardOpenRCName, "restart")
+		return cfg.RunOpenRC(ctx, "rc-service", "--nodeps", guardOpenRCName, "restart")
 	}
 	return cfg.RunSystemctl(ctx, "restart", guardServiceName)
 }
@@ -434,7 +438,7 @@ WantedBy=multi-user.target
 		return err
 	}
 	dropin := fmt.Sprintf(`[Unit]
-Requires=%s
+Wants=%s
 After=%s
 
 [Service]

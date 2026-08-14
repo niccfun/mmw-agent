@@ -227,8 +227,13 @@ func TestWriteSystemdUnitsPreservesExistingGuardArguments(t *testing.T) {
 	if !reflect.DeepEqual(got, existing) {
 		t.Fatalf("existing Guard service was overwritten: %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(root, "mmw-agent.service.d", "action-guard.conf")); err != nil {
+	dropin, err := os.ReadFile(filepath.Join(root, "mmw-agent.service.d", "action-guard.conf"))
+	if err != nil {
 		t.Fatalf("Agent drop-in was not installed: %v", err)
+	}
+	if !strings.Contains(string(dropin), "Wants="+guardServiceName) ||
+		strings.Contains(string(dropin), "Requires="+guardServiceName) {
+		t.Fatalf("Guard maintenance must not cascade-stop Agent:\n%s", dropin)
 	}
 }
 
@@ -272,7 +277,7 @@ func TestEnsureInstallsAndStartsOpenRCGuard(t *testing.T) {
 	}
 	wantCalls := [][]string{
 		{"rc-update", "add", guardOpenRCName, "default"},
-		{"rc-service", guardOpenRCName, "restart"},
+		{"rc-service", "--nodeps", guardOpenRCName, "restart"},
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("unexpected OpenRC calls: %#v", calls)
