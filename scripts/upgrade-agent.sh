@@ -17,7 +17,7 @@ set -euo pipefail
 
 REPO="iluobei/mmw-agent"
 BIN="/usr/local/bin/mmw-agent"
-GUARD_BIN="/usr/local/bin/mmwx-guardd"
+GUARD_BIN="/usr/local/bin/mmwx-guardd-agent"
 TARGET="${1:-latest}"
 AGENT_ASSET_BASE="${MMWX_AGENT_ASSET_BASE:-}"
 GUARD_DOWNLOAD_BASE="${MMWX_GUARD_DOWNLOAD_BASE:-}"
@@ -217,7 +217,6 @@ if [ -f "$AGENT_DROPIN" ]; then cp -p "$AGENT_DROPIN" "$AGENT_DROPIN_BAK"; AGENT
 install -m 0644 "$MANIFEST_TMP" /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
 if [ "$INIT_SYSTEM" = "systemd" ]; then
-if [ "$GUARD_UNIT_HAD_OLD" != "1" ]; then
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
 [Unit]
 Description=MMWX Agent Authorization Guard
@@ -226,7 +225,7 @@ Wants=network-online.target
 Before=mmw-agent.service
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mmwx-guardd --role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest
+ExecStart=/usr/local/bin/mmwx-guardd-agent --role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest
 Restart=always
 RestartSec=3
 RuntimeDirectory=mmwx-guard-agent
@@ -236,7 +235,6 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-fi
 if [ "$AGENT_DROPIN_HAD_OLD" != "1" ]; then
 cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 [Unit]
@@ -251,7 +249,7 @@ cat > /etc/init.d/mmwx-guard-agent <<'EOF'
 #!/sbin/openrc-run
 name="MMWX Agent Authorization Guard"
 description="MMWX Agent Authorization Guard"
-command="/usr/local/bin/mmwx-guardd"
+command="/usr/local/bin/mmwx-guardd-agent"
 command_args="--role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest"
 supervisor="supervise-daemon"
 respawn_delay=3

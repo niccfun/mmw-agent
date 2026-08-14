@@ -23,7 +23,7 @@ import (
 
 const (
 	defaultSocket    = "/run/mmwx-guard-agent/guard.sock"
-	defaultBinary    = "/usr/local/bin/mmwx-guardd"
+	defaultBinary    = "/usr/local/bin/mmwx-guardd-agent"
 	defaultStateDir  = "/var/lib/mmwx-guard"
 	defaultManifest  = "/usr/local/share/mmwx-guard/agent.manifest"
 	defaultSystemd   = "/etc/systemd/system"

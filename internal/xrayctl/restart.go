@@ -17,6 +17,9 @@ func RestartXray(method, customCmd string) error {
 	if method == "" || method == "auto" {
 		method = detectMethod()
 	}
+	if err := RepairReferencedPrivateKeyPermissions(); err != nil {
+		return fmt.Errorf("repair Xray certificate permissions: %w", err)
+	}
 
 	log.Printf("[XrayCtl] Restarting xray via %s", method)
 

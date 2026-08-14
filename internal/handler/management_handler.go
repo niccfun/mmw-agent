@@ -4923,17 +4923,8 @@ func deployCertFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) er
 	if err := util.CertPathSafe(keyPath); err != nil {
 		return fmt.Errorf("key path: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
-		return fmt.Errorf("create cert dir: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
-		return fmt.Errorf("create key dir: %w", err)
-	}
-	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
-		return fmt.Errorf("write cert: %w", err)
-	}
-	if err := os.WriteFile(keyPath, []byte(keyPEM), 0600); err != nil {
-		return fmt.Errorf("write key: %w", err)
+	if err := xrayctl.WriteCertificatePair(certPath, keyPath, []byte(certPEM), []byte(keyPEM), reloadTarget == "xray" || reloadTarget == "both"); err != nil {
+		return err
 	}
 
 	switch reloadTarget {
@@ -5748,7 +5739,6 @@ install -m 0644 /tmp/mmw-agent-new.manifest /usr/local/share/mmwx-guard/agent.ma
 chmod 0700 /var/lib/mmwx-guard
 if [ "$HAS_SYSTEMD" = "1" ]; then
 mkdir -p /etc/systemd/system/mmw-agent.service.d
-if [ ! -f /etc/systemd/system/mmwx-guard-agent.service ]; then
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
 [Unit]
 Description=MMWX Agent Authorization Guard
@@ -5758,7 +5748,7 @@ Before=mmw-agent.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mmwx-guardd --role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest
+ExecStart=/usr/local/bin/mmwx-guardd-agent --role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest
 Restart=always
 RestartSec=3
 RuntimeDirectory=mmwx-guard-agent
@@ -5769,7 +5759,6 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-fi
 if [ ! -f /etc/systemd/system/mmw-agent.service.d/action-guard.conf ]; then
 cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 [Unit]
@@ -5785,7 +5774,7 @@ cat > /etc/init.d/mmwx-guard-agent <<'EOF'
 #!/sbin/openrc-run
 name="MMWX Agent Authorization Guard"
 description="MMWX Agent Authorization Guard"
-command="/usr/local/bin/mmwx-guardd"
+command="/usr/local/bin/mmwx-guardd-agent"
 command_args="--role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest"
 supervisor="supervise-daemon"
 respawn_delay=3
@@ -5810,8 +5799,8 @@ if [ -f /etc/init.d/mmw-agent ]; then
 fi
 fi
 
-GUARD_BIN=/usr/local/bin/mmwx-guardd
-GUARD_BAK=/usr/local/bin/mmwx-guardd.upgrade-backup
+GUARD_BIN=/usr/local/bin/mmwx-guardd-agent
+GUARD_BAK=/usr/local/bin/mmwx-guardd-agent.upgrade-backup
 GUARD_HAD_OLD=0
 if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; else rm -f "$GUARD_BAK"; fi
 rollback_guard() {

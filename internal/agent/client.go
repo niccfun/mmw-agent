@@ -2257,17 +2257,8 @@ func deployCert(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
 	if err := util.CertPathSafe(keyPath); err != nil {
 		return fmt.Errorf("key path: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
-		return fmt.Errorf("create cert dir: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
-		return fmt.Errorf("create key dir: %w", err)
-	}
-	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
-		return fmt.Errorf("write cert: %w", err)
-	}
-	if err := os.WriteFile(keyPath, []byte(keyPEM), 0600); err != nil {
-		return fmt.Errorf("write key: %w", err)
+	if err := xrayctl.WriteCertificatePair(certPath, keyPath, []byte(certPEM), []byte(keyPEM), reloadTarget == "xray" || reloadTarget == "both"); err != nil {
+		return err
 	}
 
 	switch reloadTarget {
