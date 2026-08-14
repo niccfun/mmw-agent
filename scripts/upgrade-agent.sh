@@ -345,8 +345,7 @@ log "Agent 与 Guard 已替换，等待联合启动验证"
 
 # 6. 重启服务 — 顺序探测,谁活跃用谁
 restarted=0
-if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 \
-   && systemctl list-unit-files mmw-agent.service >/dev/null 2>&1; then
+if [ "$INIT_SYSTEM" = "systemd" ]; then
     log "systemd 模式: systemctl restart mmw-agent"
     if ! systemctl restart mmw-agent; then
         if [ -n "$BAK" ] && [ -f "$BAK" ]; then mv -f "$BAK" "$BIN"; fi
@@ -355,8 +354,7 @@ if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 \
         err "Agent 重启失败，已恢复旧 Agent、Guard 与调用方清单"
     fi
     restarted=1
-elif command -v rc-service >/dev/null 2>&1 \
-     && rc-service --exists mmw-agent 2>/dev/null; then
+elif rc-service --exists mmw-agent 2>/dev/null; then
     log "OpenRC 模式: rc-service mmw-agent restart"
     rc-service mmw-agent restart
     restarted=1
@@ -371,13 +369,27 @@ fi
 # 7. 验证
 sleep 3
 if [ $restarted -eq 1 ]; then
-    if ! systemctl is-active --quiet mmw-agent || \
+    agent_active=0
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        if systemctl is-active --quiet mmw-agent; then agent_active=1; fi
+    elif rc-service mmw-agent status >/dev/null 2>&1; then
+        agent_active=1
+    fi
+    if [ "$agent_active" != "1" ] || \
        ! "$BIN" __guard-health /run/mmwx-guard-agent/guard.sock >/dev/null 2>&1; then
         log "[ERROR] Agent/Guard 联合启动验证失败，正在成套回滚"
-        systemctl stop mmw-agent >/dev/null 2>&1 || true
+        if [ "$INIT_SYSTEM" = "systemd" ]; then
+            systemctl stop mmw-agent >/dev/null 2>&1 || true
+        else
+            rc-service mmw-agent stop >/dev/null 2>&1 || true
+        fi
         if [ -n "$BAK" ] && [ -f "$BAK" ]; then mv -f "$BAK" "$BIN"; fi
         rollback_guard
-        systemctl restart mmw-agent >/dev/null 2>&1 || true
+        if [ "$INIT_SYSTEM" = "systemd" ]; then
+            systemctl restart mmw-agent >/dev/null 2>&1 || true
+        else
+            rc-service mmw-agent restart >/dev/null 2>&1 || true
+        fi
         err "升级失败，已恢复旧 Agent、Guard 与调用方清单"
     fi
     log "✅ 升级完成，Agent 正在运行且 Guard 加密会话验证通过"
