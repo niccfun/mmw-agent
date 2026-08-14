@@ -27,7 +27,11 @@ const (
 	defaultStateDir  = "/var/lib/mmwx-guard"
 	defaultManifest  = "/usr/local/share/mmwx-guard/agent.manifest"
 	defaultSystemd   = "/etc/systemd/system"
+	defaultOpenRCDir = "/etc/init.d"
 	guardServiceName = "mmwx-guard-agent.service"
+	guardOpenRCName  = "mmwx-guard-agent"
+	initSystemd      = "systemd"
+	initOpenRC       = "openrc"
 )
 
 type Config struct {
@@ -36,11 +40,14 @@ type Config struct {
 	StateDir      string
 	ManifestPath  string
 	SystemdDir    string
+	OpenRCDir     string
+	InitSystem    string
 	DownloadBases []string
 	HTTPClient    *http.Client
 	Verify        func(string, string) error
 	VerifyHealth  func(context.Context, string) error
 	RunSystemctl  func(context.Context, ...string) error
+	RunOpenRC     func(context.Context, string, ...string) error
 	WaitForSocket func(context.Context, string) error
 }
 
@@ -48,12 +55,30 @@ type Config struct {
 // directory. It is intentionally only used by release builds that require the
 // Guard and are not running in Docker (the Docker image already bundles it).
 func EnsureDefault(ctx context.Context) error {
+	initSystem := ""
+	if _, err := os.Stat("/run/systemd/system"); err == nil {
+		if _, lookupErr := exec.LookPath("systemctl"); lookupErr == nil {
+			initSystem = initSystemd
+		}
+	}
+	if initSystem == "" {
+		if _, err := exec.LookPath("rc-service"); err == nil {
+			if _, updateErr := exec.LookPath("rc-update"); updateErr == nil {
+				initSystem = initOpenRC
+			}
+		}
+	}
+	if initSystem == "" {
+		return errors.New("Agent Guard requires systemd or OpenRC; reinstall the Agent after installing an init system")
+	}
 	cfg := Config{
 		SocketPath:    defaultSocket,
 		BinaryPath:    defaultBinary,
 		StateDir:      defaultStateDir,
 		ManifestPath:  defaultManifest,
 		SystemdDir:    defaultSystemd,
+		OpenRCDir:     defaultOpenRCDir,
+		InitSystem:    initSystem,
 		DownloadBases: defaultDownloadBases(),
 		HTTPClient:    &http.Client{Timeout: 3 * time.Minute},
 		Verify:        selfupdate.VerifyFile,
@@ -65,12 +90,25 @@ func EnsureDefault(ctx context.Context) error {
 			}
 			return nil
 		},
+		RunOpenRC: func(ctx context.Context, command string, args ...string) error {
+			cmd := exec.CommandContext(ctx, command, args...)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("%s %s: %w: %s", command, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+			}
+			return nil
+		},
 		WaitForSocket: waitForSocket,
 	}
 	return Ensure(ctx, cfg)
 }
 
 func Ensure(ctx context.Context, cfg Config) error {
+	initSystem := cfg.InitSystem
+	if initSystem == "" {
+		// Preserve the systemd default for tests and callers created before
+		// OpenRC support was added.
+		initSystem = initSystemd
+	}
 	verifyHealth := cfg.VerifyHealth
 	if verifyHealth == nil {
 		verifyHealth = verifyAgentGuardHealth
@@ -95,12 +133,20 @@ func Ensure(ctx context.Context, cfg Config) error {
 	if cfg.BinaryPath == defaultBinary && os.Geteuid() != 0 {
 		return errors.New("Agent Guard bootstrap requires root")
 	}
-	if cfg.SystemdDir == defaultSystemd {
+	if initSystem == initSystemd && cfg.SystemdDir == defaultSystemd {
 		if _, err := os.Stat("/run/systemd/system"); err != nil {
-			return errors.New("Agent Guard bootstrap requires systemd; reinstall the Agent on this host")
+			return errors.New("Agent Guard bootstrap requires a running systemd instance")
 		}
 	}
-	if cfg.Verify == nil || cfg.RunSystemctl == nil || cfg.WaitForSocket == nil || cfg.HTTPClient == nil {
+	if initSystem == initOpenRC && cfg.OpenRCDir == "" {
+		cfg.OpenRCDir = defaultOpenRCDir
+	}
+	if initSystem != initSystemd && initSystem != initOpenRC {
+		return fmt.Errorf("unsupported Agent Guard init system %q", initSystem)
+	}
+	if cfg.Verify == nil || cfg.WaitForSocket == nil || cfg.HTTPClient == nil ||
+		(initSystem == initSystemd && cfg.RunSystemctl == nil) ||
+		(initSystem == initOpenRC && cfg.RunOpenRC == nil) {
 		return errors.New("incomplete Agent Guard bootstrap configuration")
 	}
 
@@ -161,34 +207,57 @@ func Ensure(ctx context.Context, cfg Config) error {
 		rollback()
 		return err
 	}
-	if err := writeSystemdUnits(cfg); err != nil {
+	if err := writeInitFiles(cfg, initSystem); err != nil {
 		rollback()
 		return err
 	}
-	if err := cfg.RunSystemctl(ctx, "daemon-reload"); err != nil {
-		rollback()
-		return err
-	}
-	if err := cfg.RunSystemctl(ctx, "enable", "--now", guardServiceName); err != nil {
+	if err := startGuardService(ctx, cfg, initSystem); err != nil {
 		rollback()
 		return err
 	}
 	if err := cfg.WaitForSocket(ctx, cfg.SocketPath); err != nil {
 		rollback()
 		if hadBinary {
-			_ = cfg.RunSystemctl(context.Background(), "restart", guardServiceName)
+			_ = restartGuardService(context.Background(), cfg, initSystem)
 		}
 		return fmt.Errorf("Agent Guard did not become ready: %w", err)
 	}
 	if err := verifyHealth(ctx, cfg.SocketPath); err != nil {
 		rollback()
 		if hadBinary {
-			_ = cfg.RunSystemctl(context.Background(), "restart", guardServiceName)
+			_ = restartGuardService(context.Background(), cfg, initSystem)
 		}
 		return fmt.Errorf("Agent Guard health check failed: %w", err)
 	}
 	_ = os.Remove(backupPath)
 	return nil
+}
+
+func writeInitFiles(cfg Config, initSystem string) error {
+	if initSystem == initOpenRC {
+		return writeOpenRCService(cfg)
+	}
+	return writeSystemdUnits(cfg)
+}
+
+func startGuardService(ctx context.Context, cfg Config, initSystem string) error {
+	if initSystem == initOpenRC {
+		if err := cfg.RunOpenRC(ctx, "rc-update", "add", guardOpenRCName, "default"); err != nil {
+			return err
+		}
+		return cfg.RunOpenRC(ctx, "rc-service", guardOpenRCName, "restart")
+	}
+	if err := cfg.RunSystemctl(ctx, "daemon-reload"); err != nil {
+		return err
+	}
+	return cfg.RunSystemctl(ctx, "enable", "--now", guardServiceName)
+}
+
+func restartGuardService(ctx context.Context, cfg Config, initSystem string) error {
+	if initSystem == initOpenRC {
+		return cfg.RunOpenRC(ctx, "rc-service", guardOpenRCName, "restart")
+	}
+	return cfg.RunSystemctl(ctx, "restart", guardServiceName)
 }
 
 func verifyAgentGuardHealth(ctx context.Context, socket string) error {
@@ -373,6 +442,39 @@ Environment="MMWX_GUARD_SOCKET=%s"
 `, guardServiceName, guardServiceName, cfg.SocketPath)
 	if err := os.WriteFile(filepath.Join(dropinDir, "action-guard.conf"), []byte(dropin), 0o644); err != nil {
 		return fmt.Errorf("write Agent Guard service dependency: %w", err)
+	}
+	return nil
+}
+
+func writeOpenRCService(cfg Config) error {
+	if err := os.MkdirAll(cfg.OpenRCDir, 0o755); err != nil {
+		return fmt.Errorf("create OpenRC service directory: %w", err)
+	}
+	servicePath := filepath.Join(cfg.OpenRCDir, guardOpenRCName)
+	service := fmt.Sprintf(`#!/sbin/openrc-run
+name="MMWX Agent Authorization Guard"
+description="MMWX Agent Authorization Guard"
+command=%q
+command_args=%q
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+export MMWX_GUARD_SOCKET=%q
+
+depend() {
+    need net
+    before mmw-agent
+}
+
+start_pre() {
+    checkpath --directory --mode 0750 %q
+    checkpath --directory --mode 0700 %q
+}
+`, cfg.BinaryPath,
+		"--role agent --socket "+cfg.SocketPath+" --state-dir "+cfg.StateDir+" --manifest "+cfg.ManifestPath,
+		cfg.SocketPath, filepath.Dir(cfg.SocketPath), cfg.StateDir)
+	if err := os.WriteFile(servicePath, []byte(service), 0o755); err != nil {
+		return fmt.Errorf("write Agent Guard OpenRC service: %w", err)
 	}
 	return nil
 }

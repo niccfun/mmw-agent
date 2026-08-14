@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -228,5 +229,60 @@ func TestWriteSystemdUnitsPreservesExistingGuardArguments(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "mmw-agent.service.d", "action-guard.conf")); err != nil {
 		t.Fatalf("Agent drop-in was not installed: %v", err)
+	}
+}
+
+func TestEnsureInstallsAndStartsOpenRCGuard(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("signed-asset"))
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	var calls [][]string
+	cfg := Config{
+		SocketPath:    filepath.Join(root, "run", "guard.sock"),
+		BinaryPath:    filepath.Join(root, "bin", "mmwx-guardd"),
+		StateDir:      filepath.Join(root, "state"),
+		ManifestPath:  filepath.Join(root, "share", "agent.manifest"),
+		OpenRCDir:     filepath.Join(root, "init.d"),
+		InitSystem:    initOpenRC,
+		DownloadBases: []string{server.URL},
+		HTTPClient:    server.Client(),
+		Verify:        func(_, _ string) error { return nil },
+		VerifyHealth:  func(context.Context, string) error { return nil },
+		RunOpenRC: func(_ context.Context, command string, args ...string) error {
+			calls = append(calls, append([]string{command}, args...))
+			return nil
+		},
+		WaitForSocket: func(_ context.Context, socket string) error {
+			if err := os.MkdirAll(filepath.Dir(socket), 0o755); err != nil {
+				return err
+			}
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				return err
+			}
+			t.Cleanup(func() { _ = listener.Close() })
+			return nil
+		},
+	}
+	if err := Ensure(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := [][]string{
+		{"rc-update", "add", guardOpenRCName, "default"},
+		{"rc-service", guardOpenRCName, "restart"},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("unexpected OpenRC calls: %#v", calls)
+	}
+	service, err := os.ReadFile(filepath.Join(cfg.OpenRCDir, guardOpenRCName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(service), "supervisor=\"supervise-daemon\"") ||
+		!strings.Contains(string(service), "before mmw-agent") {
+		t.Fatalf("invalid OpenRC service:\n%s", service)
 	}
 }

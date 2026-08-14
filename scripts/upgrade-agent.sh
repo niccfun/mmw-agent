@@ -179,15 +179,29 @@ if [ -f "$BIN" ]; then
 fi
 
 # 4b. 先升级并验证 Guard；状态目录不动，保留设备身份与租约。失败时回滚 Guard，Agent 不变。
-[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 || err "联合升级要求 systemd，请重新运行 Agent 安装命令"
+INIT_SYSTEM=""
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    INIT_SYSTEM="systemd"
+elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    INIT_SYSTEM="openrc"
+else
+    err "联合升级要求 systemd 或 OpenRC，请重新运行 Agent 安装命令"
+fi
 AGENT_WAS_ACTIVE=0
-if systemctl is-active --quiet mmw-agent; then AGENT_WAS_ACTIVE=1; fi
-mkdir -p /var/lib/mmwx-guard /etc/systemd/system/mmw-agent.service.d
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    if systemctl is-active --quiet mmw-agent; then AGENT_WAS_ACTIVE=1; fi
+    mkdir -p /etc/systemd/system/mmw-agent.service.d
+    GUARD_UNIT="/etc/systemd/system/mmwx-guard-agent.service"
+    AGENT_DROPIN="/etc/systemd/system/mmw-agent.service.d/action-guard.conf"
+else
+    if rc-service mmw-agent status >/dev/null 2>&1; then AGENT_WAS_ACTIVE=1; fi
+    GUARD_UNIT="/etc/init.d/mmwx-guard-agent"
+    AGENT_DROPIN="/etc/init.d/mmw-agent"
+fi
+mkdir -p /var/lib/mmwx-guard
 mkdir -p /usr/local/share/mmwx-guard
 MANIFEST_BAK="/usr/local/share/mmwx-guard/agent.manifest.upgrade-backup"
-GUARD_UNIT="/etc/systemd/system/mmwx-guard-agent.service"
 GUARD_UNIT_BAK="${GUARD_UNIT}.upgrade-backup"
-AGENT_DROPIN="/etc/systemd/system/mmw-agent.service.d/action-guard.conf"
 AGENT_DROPIN_BAK="${AGENT_DROPIN}.upgrade-backup"
 MANIFEST_HAD_OLD=0
 GUARD_UNIT_HAD_OLD=0
@@ -202,6 +216,7 @@ if [ -f "$GUARD_UNIT" ]; then cp -p "$GUARD_UNIT" "$GUARD_UNIT_BAK"; GUARD_UNIT_
 if [ -f "$AGENT_DROPIN" ]; then cp -p "$AGENT_DROPIN" "$AGENT_DROPIN_BAK"; AGENT_DROPIN_HAD_OLD=1; else rm -f "$AGENT_DROPIN_BAK"; fi
 install -m 0644 "$MANIFEST_TMP" /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
+if [ "$INIT_SYSTEM" = "systemd" ]; then
 if [ "$GUARD_UNIT_HAD_OLD" != "1" ]; then
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
 [Unit]
@@ -231,11 +246,41 @@ After=mmwx-guard-agent.service
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
 fi
+else
+cat > /etc/init.d/mmwx-guard-agent <<'EOF'
+#!/sbin/openrc-run
+name="MMWX Agent Authorization Guard"
+description="MMWX Agent Authorization Guard"
+command="/usr/local/bin/mmwx-guardd"
+command_args="--role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+export MMWX_GUARD_SOCKET="/run/mmwx-guard-agent/guard.sock"
+depend() { need net; before mmw-agent; }
+start_pre() {
+    checkpath --directory --mode 0750 /run/mmwx-guard-agent
+    checkpath --directory --mode 0700 /var/lib/mmwx-guard
+}
+EOF
+chmod 0755 /etc/init.d/mmwx-guard-agent
+if ! grep -q '^export MMWX_GUARD_SOCKET=' /etc/init.d/mmw-agent; then
+    sed -i '/^respawn_max=/a export MMWX_GUARD_SOCKET="/run/mmwx-guard-agent/guard.sock"' /etc/init.d/mmw-agent
+    if ! grep -q '^export MMWX_GUARD_SOCKET=' /etc/init.d/mmw-agent; then
+        sed -i '/^depend()/i export MMWX_GUARD_SOCKET="/run/mmwx-guard-agent/guard.sock"' /etc/init.d/mmw-agent
+    fi
+fi
+sed -i 's/depend() { need net; }/depend() { need net mmwx-guard-agent; }/' /etc/init.d/mmw-agent
+fi
 GUARD_BAK="${GUARD_BIN}.upgrade-backup"
 GUARD_HAD_OLD=0
 if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; else rm -f "$GUARD_BAK"; fi
 rollback_guard() {
-    systemctl stop mmwx-guard-agent >/dev/null 2>&1 || true
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        systemctl stop mmwx-guard-agent >/dev/null 2>&1 || true
+    else
+        rc-service mmwx-guard-agent stop >/dev/null 2>&1 || true
+    fi
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
         mv -f "$GUARD_BAK" "$GUARD_BIN"
     else
@@ -248,18 +293,27 @@ rollback_guard() {
     fi
     if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then mv -f "$GUARD_UNIT_BAK" "$GUARD_UNIT"; else rm -f "$GUARD_UNIT"; fi
     if [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"; else rm -f "$AGENT_DROPIN"; fi
-    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
     if [ "$GUARD_HAD_OLD" = "1" ]; then
-        systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
+        if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true; else rc-service mmwx-guard-agent restart >/dev/null 2>&1 || true; fi
     else
-        systemctl disable mmwx-guard-agent >/dev/null 2>&1 || true
+        if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl disable mmwx-guard-agent >/dev/null 2>&1 || true; else rc-update del mmwx-guard-agent default >/dev/null 2>&1 || true; fi
     fi
-    if [ "$AGENT_WAS_ACTIVE" = "1" ]; then systemctl restart mmw-agent >/dev/null 2>&1 || true; fi
+    if [ "$AGENT_WAS_ACTIVE" = "1" ]; then
+        if [ "$INIT_SYSTEM" = "systemd" ]; then systemctl restart mmw-agent >/dev/null 2>&1 || true; else rc-service mmw-agent restart >/dev/null 2>&1 || true; fi
+    fi
 }
 mv -f "$GUARD_TMP" "${GUARD_BIN}.new"
 mv -f "${GUARD_BIN}.new" "$GUARD_BIN"
-systemctl daemon-reload
-if ! systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 || ! systemctl restart mmwx-guard-agent; then
+guard_start_ok=0
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    systemctl daemon-reload
+    if systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 && systemctl restart mmwx-guard-agent; then guard_start_ok=1; fi
+else
+    rc-update add mmwx-guard-agent default >/dev/null 2>&1 || true
+    if rc-service mmwx-guard-agent restart; then guard_start_ok=1; fi
+fi
+if [ "$guard_start_ok" != "1" ]; then
     rollback_guard
     rm -f "$BAK"
     err "Agent Guard 启动失败，已回滚；Agent 未替换"

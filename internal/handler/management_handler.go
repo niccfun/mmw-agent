@@ -5732,10 +5732,22 @@ fi
 
 # 安装/升级 Guard 服务。只替换二进制和 unit，不删除 /var/lib/mmwx-guard，
 # 因而设备 Ed25519 身份和当前许可证槽位租约会跨升级保留。
-mkdir -p /var/lib/mmwx-guard /etc/systemd/system/mmw-agent.service.d
+HAS_SYSTEMD=0
+HAS_OPENRC=0
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    HAS_SYSTEMD=1
+elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+    HAS_OPENRC=1
+else
+    echo "ERROR: Agent Guard 联合升级需要 systemd 或 OpenRC；现有 Agent/Guard 均未改动" >&2
+    exit 1
+fi
+mkdir -p /var/lib/mmwx-guard
 mkdir -p /usr/local/share/mmwx-guard
 install -m 0644 /tmp/mmw-agent-new.manifest /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
+if [ "$HAS_SYSTEMD" = "1" ]; then
+mkdir -p /etc/systemd/system/mmw-agent.service.d
 if [ ! -f /etc/systemd/system/mmwx-guard-agent.service ]; then
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
 [Unit]
@@ -5768,6 +5780,35 @@ After=mmwx-guard-agent.service
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
 fi
+else
+cat > /etc/init.d/mmwx-guard-agent <<'EOF'
+#!/sbin/openrc-run
+name="MMWX Agent Authorization Guard"
+description="MMWX Agent Authorization Guard"
+command="/usr/local/bin/mmwx-guardd"
+command_args="--role agent --socket /run/mmwx-guard-agent/guard.sock --state-dir /var/lib/mmwx-guard --manifest /usr/local/share/mmwx-guard/agent.manifest"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+export MMWX_GUARD_SOCKET="/run/mmwx-guard-agent/guard.sock"
+depend() { need net; before mmw-agent; }
+start_pre() {
+    checkpath --directory --mode 0750 /run/mmwx-guard-agent
+    checkpath --directory --mode 0700 /var/lib/mmwx-guard
+}
+EOF
+chmod 0755 /etc/init.d/mmwx-guard-agent
+# Normalize older Alpine Agent services so Guard starts first and its socket is inherited.
+if [ -f /etc/init.d/mmw-agent ]; then
+    if ! grep -q '^export MMWX_GUARD_SOCKET=' /etc/init.d/mmw-agent; then
+        sed -i '/^respawn_max=/a export MMWX_GUARD_SOCKET="/run/mmwx-guard-agent/guard.sock"' /etc/init.d/mmw-agent
+        if ! grep -q '^export MMWX_GUARD_SOCKET=' /etc/init.d/mmw-agent; then
+            sed -i '/^depend()/i export MMWX_GUARD_SOCKET="/run/mmwx-guard-agent/guard.sock"' /etc/init.d/mmw-agent
+        fi
+    fi
+    sed -i 's/depend() { need net; }/depend() { need net mmwx-guard-agent; }/' /etc/init.d/mmw-agent
+fi
+fi
 
 GUARD_BIN=/usr/local/bin/mmwx-guardd
 GUARD_BAK=/usr/local/bin/mmwx-guardd.upgrade-backup
@@ -5776,18 +5817,35 @@ if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; e
 rollback_guard() {
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
         mv -f "$GUARD_BAK" "$GUARD_BIN"
-        systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
+        if [ "$HAS_SYSTEMD" = "1" ]; then
+            systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
+        else
+            rc-service mmwx-guard-agent restart >/dev/null 2>&1 || true
+        fi
     else
-        systemctl disable --now mmwx-guard-agent >/dev/null 2>&1 || true
-        rm -f "$GUARD_BIN" /etc/systemd/system/mmwx-guard-agent.service /etc/systemd/system/mmw-agent.service.d/action-guard.conf
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        if [ "$HAS_SYSTEMD" = "1" ]; then
+            systemctl disable --now mmwx-guard-agent >/dev/null 2>&1 || true
+            rm -f "$GUARD_BIN" /etc/systemd/system/mmwx-guard-agent.service /etc/systemd/system/mmw-agent.service.d/action-guard.conf
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        else
+            rc-service mmwx-guard-agent stop >/dev/null 2>&1 || true
+            rc-update del mmwx-guard-agent default >/dev/null 2>&1 || true
+            rm -f "$GUARD_BIN" /etc/init.d/mmwx-guard-agent
+        fi
     fi
 }
 chmod 0755 /tmp/mmwx-guardd-new
 mv -f /tmp/mmwx-guardd-new "$GUARD_BIN.new"
 mv -f "$GUARD_BIN.new" "$GUARD_BIN"
-systemctl daemon-reload
-if ! systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 || ! systemctl restart mmwx-guard-agent; then
+guard_start_ok=0
+if [ "$HAS_SYSTEMD" = "1" ]; then
+    systemctl daemon-reload
+    if systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 && systemctl restart mmwx-guard-agent; then guard_start_ok=1; fi
+else
+    rc-update add mmwx-guard-agent default >/dev/null 2>&1 || true
+    if rc-service mmwx-guard-agent restart; then guard_start_ok=1; fi
+fi
+if [ "$guard_start_ok" != "1" ]; then
     echo "ERROR: Agent Guard 启动失败，正在回滚" >&2
     rollback_guard
     rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig /tmp/mmwx-guardd-new.sig
