@@ -5606,11 +5606,6 @@ if [ "${DOCKER:-0}" = "1" ] || [ -f /.dockerenv ]; then
     echo "ERROR: Docker Agent 必须更新容器镜像，不能在容器内替换 Agent/Guard" >&2
     exit 1
 fi
-if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
-    echo "ERROR: Agent Guard 联合升级当前要求 systemd；请重新运行 Agent 安装命令" >&2
-    exit 1
-fi
-
 # 镜像链 — 顺序尝试,任一成功即停。GitHub 优先,失败再自动降级到 CDN 代理。
 # 注:GitHub Release binary 实际重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
 # 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 会快速失败(近乎即时,
@@ -5735,6 +5730,23 @@ else
 fi
 mkdir -p /var/lib/mmwx-guard
 mkdir -p /usr/local/share/mmwx-guard
+if [ "$HAS_SYSTEMD" = "1" ]; then
+    GUARD_UNIT=/etc/systemd/system/mmwx-guard-agent.service
+    AGENT_DROPIN=/etc/systemd/system/mmw-agent.service.d/action-guard.conf
+else
+    GUARD_UNIT=/etc/init.d/mmwx-guard-agent
+    AGENT_DROPIN=/etc/init.d/mmw-agent
+fi
+MANIFEST_PATH=/usr/local/share/mmwx-guard/agent.manifest
+MANIFEST_BAK="${MANIFEST_PATH}.upgrade-backup"
+GUARD_UNIT_BAK="${GUARD_UNIT}.upgrade-backup"
+AGENT_DROPIN_BAK="${AGENT_DROPIN}.upgrade-backup"
+MANIFEST_HAD_OLD=0
+GUARD_UNIT_HAD_OLD=0
+AGENT_DROPIN_HAD_OLD=0
+if [ -f "$MANIFEST_PATH" ]; then cp -p "$MANIFEST_PATH" "$MANIFEST_BAK"; MANIFEST_HAD_OLD=1; else rm -f "$MANIFEST_BAK"; fi
+if [ -f "$GUARD_UNIT" ]; then cp -p "$GUARD_UNIT" "$GUARD_UNIT_BAK"; GUARD_UNIT_HAD_OLD=1; else rm -f "$GUARD_UNIT_BAK"; fi
+if [ -f "$AGENT_DROPIN" ]; then cp -p "$AGENT_DROPIN" "$AGENT_DROPIN_BAK"; AGENT_DROPIN_HAD_OLD=1; else rm -f "$AGENT_DROPIN_BAK"; fi
 install -m 0644 /tmp/mmw-agent-new.manifest /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
 if [ "$HAS_SYSTEMD" = "1" ]; then
@@ -5804,8 +5816,35 @@ GUARD_BAK=/usr/local/bin/mmwx-guardd-agent.upgrade-backup
 GUARD_HAD_OLD=0
 if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; else rm -f "$GUARD_BAK"; fi
 rollback_guard() {
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        systemctl stop mmwx-guard-agent >/dev/null 2>&1 || true
+    else
+        rc-service mmwx-guard-agent stop >/dev/null 2>&1 || true
+    fi
     if [ "$GUARD_HAD_OLD" = "1" ] && [ -f "$GUARD_BAK" ]; then
         mv -f "$GUARD_BAK" "$GUARD_BIN"
+    else
+        rm -f "$GUARD_BIN"
+    fi
+    if [ "$MANIFEST_HAD_OLD" = "1" ] && [ -f "$MANIFEST_BAK" ]; then
+        mv -f "$MANIFEST_BAK" "$MANIFEST_PATH"
+    else
+        rm -f "$MANIFEST_PATH"
+    fi
+    if [ "$GUARD_UNIT_HAD_OLD" = "1" ] && [ -f "$GUARD_UNIT_BAK" ]; then
+        mv -f "$GUARD_UNIT_BAK" "$GUARD_UNIT"
+    else
+        rm -f "$GUARD_UNIT"
+    fi
+    if [ "$AGENT_DROPIN_HAD_OLD" = "1" ] && [ -f "$AGENT_DROPIN_BAK" ]; then
+        mv -f "$AGENT_DROPIN_BAK" "$AGENT_DROPIN"
+    else
+        rm -f "$AGENT_DROPIN"
+    fi
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [ "$GUARD_UNIT_HAD_OLD" = "1" ]; then
         if [ "$HAS_SYSTEMD" = "1" ]; then
             systemctl restart mmwx-guard-agent >/dev/null 2>&1 || true
         else
@@ -5813,13 +5852,9 @@ rollback_guard() {
         fi
     else
         if [ "$HAS_SYSTEMD" = "1" ]; then
-            systemctl disable --now mmwx-guard-agent >/dev/null 2>&1 || true
-            rm -f "$GUARD_BIN" /etc/systemd/system/mmwx-guard-agent.service /etc/systemd/system/mmw-agent.service.d/action-guard.conf
-            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl disable mmwx-guard-agent >/dev/null 2>&1 || true
         else
-            rc-service mmwx-guard-agent stop >/dev/null 2>&1 || true
             rc-update del mmwx-guard-agent default >/dev/null 2>&1 || true
-            rm -f "$GUARD_BIN" /etc/init.d/mmwx-guard-agent
         fi
     fi
 }
@@ -5866,7 +5901,7 @@ if ! cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new || \
     rollback_guard
     exit 1
 fi
-rm -f "$GUARD_BAK"
+rm -f "$GUARD_BAK" "$MANIFEST_BAK" "$GUARD_UNIT_BAK" "$AGENT_DROPIN_BAK"
 rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig
 trap - EXIT
 echo "Binary replaced; Agent and Guard upgraded; agent will self-exec the new version."
