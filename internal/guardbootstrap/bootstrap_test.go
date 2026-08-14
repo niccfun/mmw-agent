@@ -201,3 +201,32 @@ func TestVerifyAgentGuardHealthRejectsWrongRole(t *testing.T) {
 		t.Fatal("master Guard accepted as Agent Guard")
 	}
 }
+
+func TestWriteSystemdUnitsPreservesExistingGuardArguments(t *testing.T) {
+	root := t.TempDir()
+	servicePath := filepath.Join(root, guardServiceName)
+	existing := []byte("[Service]\nExecStart=/old/guard --license-server https://license.example\n")
+	if err := os.WriteFile(servicePath, existing, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		SocketPath:   filepath.Join(root, "guard.sock"),
+		BinaryPath:   filepath.Join(root, "guard"),
+		StateDir:     filepath.Join(root, "state"),
+		ManifestPath: filepath.Join(root, "manifest"),
+		SystemdDir:   root,
+	}
+	if err := writeSystemdUnits(cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(servicePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, existing) {
+		t.Fatalf("existing Guard service was overwritten: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "mmw-agent.service.d", "action-guard.conf")); err != nil {
+		t.Fatalf("Agent drop-in was not installed: %v", err)
+	}
+}

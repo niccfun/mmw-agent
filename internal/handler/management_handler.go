@@ -5736,6 +5736,7 @@ mkdir -p /var/lib/mmwx-guard /etc/systemd/system/mmw-agent.service.d
 mkdir -p /usr/local/share/mmwx-guard
 install -m 0644 /tmp/mmw-agent-new.manifest /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
+if [ ! -f /etc/systemd/system/mmwx-guard-agent.service ]; then
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
 [Unit]
 Description=MMWX Agent Authorization Guard
@@ -5756,6 +5757,8 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+if [ ! -f /etc/systemd/system/mmw-agent.service.d/action-guard.conf ]; then
 cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 [Unit]
 Requires=mmwx-guard-agent.service
@@ -5764,6 +5767,7 @@ After=mmwx-guard-agent.service
 [Service]
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
+fi
 
 GUARD_BIN=/usr/local/bin/mmwx-guardd
 GUARD_BAK=/usr/local/bin/mmwx-guardd.upgrade-backup

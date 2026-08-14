@@ -180,6 +180,8 @@ fi
 
 # 4b. 先升级并验证 Guard；状态目录不动，保留设备身份与租约。失败时回滚 Guard，Agent 不变。
 [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 || err "联合升级要求 systemd，请重新运行 Agent 安装命令"
+AGENT_WAS_ACTIVE=0
+if systemctl is-active --quiet mmw-agent; then AGENT_WAS_ACTIVE=1; fi
 mkdir -p /var/lib/mmwx-guard /etc/systemd/system/mmw-agent.service.d
 mkdir -p /usr/local/share/mmwx-guard
 MANIFEST_BAK="/usr/local/share/mmwx-guard/agent.manifest.upgrade-backup"
@@ -200,6 +202,7 @@ if [ -f "$GUARD_UNIT" ]; then cp -p "$GUARD_UNIT" "$GUARD_UNIT_BAK"; GUARD_UNIT_
 if [ -f "$AGENT_DROPIN" ]; then cp -p "$AGENT_DROPIN" "$AGENT_DROPIN_BAK"; AGENT_DROPIN_HAD_OLD=1; else rm -f "$AGENT_DROPIN_BAK"; fi
 install -m 0644 "$MANIFEST_TMP" /usr/local/share/mmwx-guard/agent.manifest
 chmod 0700 /var/lib/mmwx-guard
+if [ "$GUARD_UNIT_HAD_OLD" != "1" ]; then
 cat > /etc/systemd/system/mmwx-guard-agent.service <<'EOF'
 [Unit]
 Description=MMWX Agent Authorization Guard
@@ -218,6 +221,8 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
+if [ "$AGENT_DROPIN_HAD_OLD" != "1" ]; then
 cat > /etc/systemd/system/mmw-agent.service.d/action-guard.conf <<'EOF'
 [Unit]
 Requires=mmwx-guard-agent.service
@@ -225,6 +230,7 @@ After=mmwx-guard-agent.service
 [Service]
 Environment="MMWX_GUARD_SOCKET=/run/mmwx-guard-agent/guard.sock"
 EOF
+fi
 GUARD_BAK="${GUARD_BIN}.upgrade-backup"
 GUARD_HAD_OLD=0
 if [ -f "$GUARD_BIN" ]; then cp -p "$GUARD_BIN" "$GUARD_BAK"; GUARD_HAD_OLD=1; else rm -f "$GUARD_BAK"; fi
@@ -248,17 +254,20 @@ rollback_guard() {
     else
         systemctl disable mmwx-guard-agent >/dev/null 2>&1 || true
     fi
+    if [ "$AGENT_WAS_ACTIVE" = "1" ]; then systemctl restart mmw-agent >/dev/null 2>&1 || true; fi
 }
 mv -f "$GUARD_TMP" "${GUARD_BIN}.new"
 mv -f "${GUARD_BIN}.new" "$GUARD_BIN"
 systemctl daemon-reload
 if ! systemctl enable --now mmwx-guard-agent >/dev/null 2>&1 || ! systemctl restart mmwx-guard-agent; then
     rollback_guard
+    rm -f "$BAK"
     err "Agent Guard 启动失败，已回滚；Agent 未替换"
 fi
 for _ in $(seq 1 50); do [ -S /run/mmwx-guard-agent/guard.sock ] && break; sleep .1; done
 if [ ! -S /run/mmwx-guard-agent/guard.sock ]; then
     rollback_guard
+    rm -f "$BAK"
     err "Agent Guard 未就绪，已回滚；Agent 未替换"
 fi
 rm -f "$GUARD_TMP.sig"
@@ -270,6 +279,7 @@ if [ "$agent_changed" = "1" ]; then
     if ! cp "$TMP" "${BIN}.new" || ! chmod 0755 "${BIN}.new" || ! mv -f "${BIN}.new" "$BIN"; then
         rm -f "${BIN}.new"
         rollback_guard
+        rm -f "$BAK"
         err "Agent 替换失败，Agent Guard 已回滚"
     fi
     rm -f "$TMP"

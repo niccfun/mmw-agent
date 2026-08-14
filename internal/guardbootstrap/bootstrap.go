@@ -71,7 +71,11 @@ func EnsureDefault(ctx context.Context) error {
 }
 
 func Ensure(ctx context.Context, cfg Config) error {
-	if socketReady(cfg.SocketPath) {
+	verifyHealth := cfg.VerifyHealth
+	if verifyHealth == nil {
+		verifyHealth = verifyAgentGuardHealth
+	}
+	if socketReady(cfg.SocketPath) && verifyHealth(ctx, cfg.SocketPath) == nil {
 		return nil
 	}
 	// systemd ordering waits for the Guard process to start, not for its Unix
@@ -81,7 +85,7 @@ func Ensure(ctx context.Context, cfg Config) error {
 		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err = cfg.WaitForSocket(readyCtx, cfg.SocketPath)
 		cancel()
-		if err == nil {
+		if err == nil && verifyHealth(ctx, cfg.SocketPath) == nil {
 			return nil
 		}
 	}
@@ -175,10 +179,6 @@ func Ensure(ctx context.Context, cfg Config) error {
 			_ = cfg.RunSystemctl(context.Background(), "restart", guardServiceName)
 		}
 		return fmt.Errorf("Agent Guard did not become ready: %w", err)
-	}
-	verifyHealth := cfg.VerifyHealth
-	if verifyHealth == nil {
-		verifyHealth = verifyAgentGuardHealth
 	}
 	if err := verifyHealth(ctx, cfg.SocketPath); err != nil {
 		rollback()
@@ -353,8 +353,12 @@ PrivateTmp=true
 WantedBy=multi-user.target
 `, cfg.BinaryPath, cfg.SocketPath, cfg.StateDir, cfg.ManifestPath)
 	servicePath := filepath.Join(cfg.SystemdDir, guardServiceName)
-	if err := os.WriteFile(servicePath, []byte(service), 0o644); err != nil {
-		return fmt.Errorf("write Agent Guard service: %w", err)
+	if _, err := os.Stat(servicePath); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(servicePath, []byte(service), 0o644); err != nil {
+			return fmt.Errorf("write Agent Guard service: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("inspect Agent Guard service: %w", err)
 	}
 	dropinDir := filepath.Join(cfg.SystemdDir, "mmw-agent.service.d")
 	if err := os.MkdirAll(dropinDir, 0o755); err != nil {
