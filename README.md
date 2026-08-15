@@ -49,6 +49,13 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.5.6 (2026-08-16)
+- 🛠️ fix: Agent 0.5.5 连接数为 0、租约竞态及 Xray 重启漏记
+- 🛠️ fix: agent guard升级失败
+- 🛠️ fix: nginx配置兜底
+- 🛠️ fix: 租约无法替换
+- 🛠️ fix: 级联删除入站
+
 ### v0.5.5 (2026-08-15)
 - 🛠️ fix: agent guard升级失败
 - 🛠️ fix: agent一键升级失败
