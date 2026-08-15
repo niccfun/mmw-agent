@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -120,5 +121,82 @@ func TestAtomicWriteConfigReplacesCompleteFile(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestRemoveInboundRoutingReferences(t *testing.T) {
+	config := map[string]interface{}{
+		"routing": map[string]interface{}{
+			"rules": []interface{}{
+				map[string]interface{}{"inboundTag": []interface{}{"old-in"}, "outboundTag": "drop"},
+				map[string]interface{}{"inboundTag": []interface{}{"old-in", "keep-in"}, "outboundTag": "direct"},
+				map[string]interface{}{"inboundTag": "old-in", "outboundTag": "proxy"},
+				map[string]interface{}{"domain": []interface{}{"example.com"}, "outboundTag": "direct"},
+			},
+		},
+	}
+
+	if changed := removeInboundRoutingReferences(config, "old-in"); changed != 3 {
+		t.Fatalf("removed references = %d, want 3", changed)
+	}
+	rules := config["routing"].(map[string]interface{})["rules"].([]interface{})
+	if len(rules) != 2 {
+		t.Fatalf("remaining rules = %d, want 2: %#v", len(rules), rules)
+	}
+	tags := rules[0].(map[string]interface{})["inboundTag"].([]interface{})
+	if len(tags) != 1 || tags[0] != "keep-in" {
+		t.Fatalf("multi-inbound rule was not narrowed correctly: %#v", tags)
+	}
+	if _, ok := rules[1].(map[string]interface{})["domain"]; !ok {
+		t.Fatalf("unrelated routing rule was removed: %#v", rules[1])
+	}
+}
+
+func TestRemoveInboundFromConfDir(t *testing.T) {
+	dir := t.TempDir()
+	single := filepath.Join(dir, "single.json")
+	if err := os.WriteFile(single, []byte(`{"tag":"old-in","protocol":"vless","port":443}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(dir, "bundle.json")
+	bundleJSON := `{
+  "inbounds": [
+    {"tag":"old-in","protocol":"vless","port":8443},
+    {"tag":"keep-in","protocol":"vmess","port":9443}
+  ],
+  "routing": {"rules": [
+    {"inboundTag":["old-in","keep-in"],"outboundTag":"direct"}
+  ]}
+}`
+	if err := os.WriteFile(bundle, []byte(bundleJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	routingChanged, err := removeInboundFromConfDir(dir, "", "old-in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !routingChanged {
+		t.Fatal("confdir routing reference was not reported as changed")
+	}
+	if _, err := os.Stat(single); !os.IsNotExist(err) {
+		t.Fatalf("single-inbound fragment still exists: %v", err)
+	}
+	content, err := os.ReadFile(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		t.Fatal(err)
+	}
+	inbounds := config["inbounds"].([]interface{})
+	if len(inbounds) != 1 || inbounds[0].(map[string]interface{})["tag"] != "keep-in" {
+		t.Fatalf("confdir inbounds not cleaned: %#v", inbounds)
+	}
+	rules := config["routing"].(map[string]interface{})["rules"].([]interface{})
+	tags := rules[0].(map[string]interface{})["inboundTag"].([]interface{})
+	if len(tags) != 1 || tags[0] != "keep-in" {
+		t.Fatalf("confdir route not narrowed: %#v", tags)
 	}
 }

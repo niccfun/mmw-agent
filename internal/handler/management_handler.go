@@ -2608,7 +2608,7 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 从配置文件移除（主流程）
-		configErr := h.removeInboundFromConfig(req.Tag)
+		routingChanged, configErr := h.removeInboundFromConfig(req.Tag)
 		if configErr != nil {
 			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
 		}
@@ -2632,10 +2632,18 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 配置成功时，运行态报错可接受（可能尚未加载）
+		// routing 只能通过重载生效；若运行态删除异常，也通过重载配置清除
+		// runtime-only 残留，避免列表重新出现同名但无端口的旧入站。
+		if routingChanged || (runtimeErr != nil && !strings.Contains(runtimeErr.Error(), "not enough information")) {
+			if restartErr := h.RestartXray(); restartErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("入站配置已删除，但 Xray 重载失败: %v", restartErr))
+				return
+			}
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
-			"message": "Inbound removed successfully",
+			"message": "入站及关联路由已删除",
 		})
 
 	default:
@@ -2734,7 +2742,7 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 			log.Printf("[Manage] Warning: Failed to remove inbound from runtime: %v", runtimeErr)
 		}
 
-		configErr := h.removeInboundFromConfig(req.Tag)
+		routingChanged, configErr := h.removeInboundFromConfig(req.Tag)
 		if configErr != nil {
 			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
 		}
@@ -2748,9 +2756,16 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 			return
 		}
 
+		if routingChanged || runtimeErr != nil {
+			if restartErr := h.RestartXray(); restartErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("入站配置已删除，但 Xray 重载失败: %v", restartErr))
+				return
+			}
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
-			"message": "Inbound removed successfully",
+			"message": "入站及关联路由已删除",
 		})
 
 	default:
@@ -4250,20 +4265,175 @@ func (h *ManageHandler) persistInbound(inbound map[string]interface{}) error {
 	return os.WriteFile(configPath, newContent, 0644)
 }
 
-func (h *ManageHandler) removeInboundFromConfig(tag string) error {
+func inboundMatchesRemovalTag(inbound map[string]interface{}, tag string) bool {
+	if inboundTag, _ := inbound["tag"].(string); inboundTag != "" {
+		return inboundTag == tag
+	}
+	protocol, _ := inbound["protocol"].(string)
+	port := 0
+	switch value := inbound["port"].(type) {
+	case float64:
+		port = int(value)
+	case int:
+		port = value
+	}
+	return protocol != "" && port > 0 && tag == fmt.Sprintf("%s-%d", protocol, port)
+}
+
+// removeInboundRoutingReferences 清理引用已删除入站的路由规则。
+// 规则仅关联该入站时整条删除；同时关联多个入站时只移除目标 tag。
+func removeInboundRoutingReferences(config map[string]interface{}, tag string) int {
+	routing, _ := config["routing"].(map[string]interface{})
+	if routing == nil {
+		return 0
+	}
+	rules, ok := routing["rules"].([]interface{})
+	if !ok {
+		return 0
+	}
+	changed := 0
+	kept := make([]interface{}, 0, len(rules))
+	for _, rawRule := range rules {
+		rule, ok := rawRule.(map[string]interface{})
+		if !ok {
+			kept = append(kept, rawRule)
+			continue
+		}
+		rawTags, exists := rule["inboundTag"]
+		if !exists {
+			kept = append(kept, rawRule)
+			continue
+		}
+		switch tags := rawTags.(type) {
+		case []interface{}:
+			remaining := make([]interface{}, 0, len(tags))
+			for _, rawTag := range tags {
+				if value, ok := rawTag.(string); ok && value == tag {
+					changed++
+					continue
+				}
+				remaining = append(remaining, rawTag)
+			}
+			if len(remaining) == 0 && len(tags) > 0 {
+				continue
+			}
+			if len(remaining) != len(tags) {
+				rule["inboundTag"] = remaining
+			}
+		case []string:
+			remaining := make([]string, 0, len(tags))
+			for _, value := range tags {
+				if value == tag {
+					changed++
+					continue
+				}
+				remaining = append(remaining, value)
+			}
+			if len(remaining) == 0 && len(tags) > 0 {
+				continue
+			}
+			if len(remaining) != len(tags) {
+				rule["inboundTag"] = remaining
+			}
+		case string:
+			if tags == tag {
+				changed++
+				continue
+			}
+		}
+		kept = append(kept, rawRule)
+	}
+	if changed > 0 {
+		routing["rules"] = kept
+	}
+	return changed
+}
+
+// removeInboundFromConfDir 清理旧版 Xray -confdir 中的拆分入站配置。
+// 单入站文件命中时删除该片段；组合配置则只重写其中匹配的入站和路由引用。
+func removeInboundFromConfDir(confDir, mainPath, tag string) (bool, error) {
+	if strings.TrimSpace(confDir) == "" {
+		return false, nil
+	}
+	entries, err := os.ReadDir(confDir)
+	if err != nil {
+		return false, fmt.Errorf("read xray confdir: %w", err)
+	}
+	routingChanged := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		path := filepath.Join(confDir, entry.Name())
+		if filepath.Clean(path) == filepath.Clean(mainPath) {
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return routingChanged, fmt.Errorf("read xray config fragment %s: %w", path, err)
+		}
+		var config map[string]interface{}
+		if err := json.Unmarshal(content, &config); err != nil {
+			return routingChanged, fmt.Errorf("parse xray config fragment %s: %w", path, err)
+		}
+
+		// 老 mmw 常把一个 inbound 直接作为一个 confdir JSON 文件。
+		if _, singleInbound := config["protocol"].(string); singleInbound {
+			if inboundMatchesRemovalTag(config, tag) {
+				if err := os.Remove(path); err != nil {
+					return routingChanged, fmt.Errorf("remove xray inbound fragment %s: %w", path, err)
+				}
+			}
+			continue
+		}
+
+		changed := false
+		if inbounds, ok := config["inbounds"].([]interface{}); ok {
+			kept := make([]interface{}, 0, len(inbounds))
+			for _, rawInbound := range inbounds {
+				inbound, ok := rawInbound.(map[string]interface{})
+				if ok && inboundMatchesRemovalTag(inbound, tag) {
+					changed = true
+					continue
+				}
+				kept = append(kept, rawInbound)
+			}
+			if changed {
+				config["inbounds"] = kept
+			}
+		}
+		if removeInboundRoutingReferences(config, tag) > 0 {
+			routingChanged = true
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		updated, err := json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return routingChanged, fmt.Errorf("marshal xray config fragment %s: %w", path, err)
+		}
+		if err := os.WriteFile(path, updated, 0644); err != nil {
+			return routingChanged, fmt.Errorf("write xray config fragment %s: %w", path, err)
+		}
+	}
+	return routingChanged, nil
+}
+
+func (h *ManageHandler) removeInboundFromConfig(tag string) (bool, error) {
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
-		return fmt.Errorf("config file not found")
+		return false, fmt.Errorf("config file not found")
 	}
 
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("failed to read config: %w", err)
+		return false, fmt.Errorf("failed to read config: %w", err)
 	}
 
 	var config map[string]interface{}
 	if err := json.Unmarshal(content, &config); err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
+		return false, fmt.Errorf("failed to parse config: %w", err)
 	}
 
 	inbounds, _ := config["inbounds"].([]interface{})
@@ -4274,35 +4444,29 @@ func (h *ManageHandler) removeInboundFromConfig(tag string) error {
 			newInbounds = append(newInbounds, ib)
 			continue
 		}
-		ibTag, _ := inbound["tag"].(string)
-		if ibTag == tag {
-			continue // 精确匹配 → 删
-		}
-		// listInbounds 会给 tag 缺失的 inbound 虚拟一个 `<protocol>-<port>` tag 让前端能引用,
-		// remove 时也要识别这种虚拟 tag,否则原 inbound 永远删不掉 → mmwx 再 add 一份 → 同端口两份 inbound → xray 启动失败
-		if ibTag == "" {
-			proto, _ := inbound["protocol"].(string)
-			port := 0
-			switch p := inbound["port"].(type) {
-			case float64:
-				port = int(p)
-			case int:
-				port = p
-			}
-			if proto != "" && port > 0 && tag == fmt.Sprintf("%s-%d", proto, port) {
-				continue
-			}
+		// 同时识别 listInbounds 为无 tag 旧配置生成的 <protocol>-<port> 标签。
+		if inboundMatchesRemovalTag(inbound, tag) {
+			continue
 		}
 		newInbounds = append(newInbounds, ib)
 	}
 	config["inbounds"] = newInbounds
+	routingChanged := removeInboundRoutingReferences(config, tag) > 0
 
 	newContent, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return false, fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	return os.WriteFile(configPath, newContent, 0644)
+	if err := os.WriteFile(configPath, newContent, 0644); err != nil {
+		return false, err
+	}
+	paths := h.findXrayConfigInfo()
+	confDirRoutingChanged, err := removeInboundFromConfDir(paths.ConfDir, configPath, tag)
+	if err != nil {
+		return routingChanged, err
+	}
+	return routingChanged || confDirRoutingChanged, nil
 }
 
 func (h *ManageHandler) persistOutbound(outbound map[string]interface{}) error {

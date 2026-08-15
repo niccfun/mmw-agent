@@ -56,10 +56,26 @@ type Config struct {
 	WaitForSocket func(context.Context, string) error
 }
 
+func healthyExistingGuard(ctx context.Context, socket string, verify func(context.Context, string) error) bool {
+	if !socketReady(socket) {
+		return false
+	}
+	healthCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return verify(healthCtx, socket) == nil
+}
+
 // EnsureDefault makes a signed Guard available without replacing its state
 // directory. It is intentionally only used by release builds that require the
 // Guard and are not running in Docker (the Docker image already bundles it).
 func EnsureDefault(ctx context.Context) error {
+	// OpenVZ and other minimal containers may run Guard under the install
+	// script's supervisor without systemd/OpenRC. Accept an already healthy
+	// default Guard before requiring an init system for bootstrap/repair.
+	if healthyExistingGuard(ctx, defaultSocket, verifyAgentGuardHealth) {
+		return nil
+	}
+
 	initSystem := ""
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
 		if _, lookupErr := exec.LookPath("systemctl"); lookupErr == nil {

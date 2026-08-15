@@ -185,6 +185,26 @@ func TestEnsureInstallsGuardWithoutReplacingState(t *testing.T) {
 	}
 }
 
+func TestHealthyExistingGuardAcceptsSupervisorManagedSocket(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "guard.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	called := false
+	if !healthyExistingGuard(context.Background(), socket, func(context.Context, string) error {
+		called = true
+		return nil
+	}) {
+		t.Fatal("healthy supervisor-managed Guard socket was rejected")
+	}
+	if !called {
+		t.Fatal("Guard health verifier was not called")
+	}
+}
+
 func TestEnsureReturnsWhenSocketAlreadyReady(t *testing.T) {
 	// A regular file is deliberately not accepted as a ready Unix socket.
 	path := filepath.Join(t.TempDir(), "guard.sock")
