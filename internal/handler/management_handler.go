@@ -509,54 +509,15 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 }
 
 func (h *ManageHandler) getNginxStatus() *ServiceStatus {
-	status := &ServiceStatus{}
-
-	// 先查 PATH，再查编译安装路径
-	nginxPath, err := exec.LookPath("nginx")
-	if err != nil {
-		for _, candidate := range constants.NginxBinarySearchPaths {
-			if strings.Contains(candidate, "/") {
-				if _, statErr := os.Stat(candidate); statErr == nil {
-					nginxPath = candidate
-					err = nil
-					break
-				}
-			}
-		}
+	runtime := inspectNginxRuntime()
+	status := &ServiceStatus{
+		Installed: runtime.Installed,
+		Running:   runtime.Running,
+		Version:   runtime.Version,
 	}
-	if err == nil {
-		status.Installed = true
-		cmd := exec.Command(nginxPath, "-v")
-		output, err := cmd.CombinedOutput()
-		if err == nil {
-			status.Version = strings.TrimSpace(string(output))
-		}
-	}
-
 	if nginxInstalling.Load() {
 		status.Version = "安装中..."
 	}
-	// 优先使用 systemctl 检查
-	cmd := exec.Command("systemctl", "is-active", "nginx")
-	output, _ := cmd.Output()
-	if strings.TrimSpace(string(output)) == "active" {
-		status.Running = true
-		return status
-	}
-
-	// 兜底：用 pgrep 检查 nginx 进程
-	pgrepCmd := exec.Command("pgrep", "-x", "nginx")
-	if err := pgrepCmd.Run(); err == nil {
-		status.Running = true
-		return status
-	}
-
-	// 兜底：用 ps 检查 nginx master 进程
-	psCmd := exec.Command("bash", "-c", "ps aux | grep -v grep | grep -E 'nginx: master' | head -1")
-	if output, err := psCmd.Output(); err == nil && len(strings.TrimSpace(string(output))) > 0 {
-		status.Running = true
-	}
-
 	return status
 }
 
@@ -1267,13 +1228,17 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Nginx installation already in progress")
 		return
 	}
-	// User-installed nginx is a valid website host. Do not run the MMWX install
-	// script over it; website discovery separately verifies whether its main
-	// config includes the managed servers directory.
-	if bin := findNginxBinary(); bin != "" {
+	// 已有 MMWX Nginx 若缺少 servers include，原地补齐并经过 nginx -t/reload
+	// 校验；外部安装不会被自动改写。
+	if inspectNginxRuntime().Installed {
+		bin := findNginxBinary()
+		if err := ensureNginxManagedConfig(); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
-			"message": "Nginx already installed at " + bin,
+			"message": "Nginx already installed and managed config is ready at " + bin,
 		})
 		return
 	}
@@ -1364,6 +1329,10 @@ func (h *ManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		log.Printf("[Manage] Nginx removal failed: %v, stderr: %s", err, stderr.String())
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Removal failed: %v", err))
+		return
+	}
+	if bin := findNginxBinary(); bin != "" {
+		writeError(w, http.StatusConflict, fmt.Sprintf("MMWX Nginx 已清理，但系统仍存在其他 Nginx: %s；请用系统包管理器卸载后刷新", bin))
 		return
 	}
 
@@ -5698,6 +5667,21 @@ func (h *ManageHandler) HandleNginxInstallStream(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusConflict, "Nginx installation already in progress")
 		return
 	}
+	if inspectNginxRuntime().Installed {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+		if err := ensureNginxManagedConfig(); err != nil {
+			sseEvent(w, flusher, map[string]string{"type": "error", "message": err.Error()})
+		} else {
+			sseEvent(w, flusher, map[string]interface{}{"type": "complete", "success": true, "message": "Nginx 配置已就绪"})
+		}
+		return
+	}
 	nginxInstalling.Store(true)
 	defer nginxInstalling.Store(false)
 
@@ -5725,7 +5709,16 @@ func (h *ManageHandler) HandleNginxRemoveStream(w http.ResponseWriter, r *http.R
 	}
 	log.Printf("[Manage] Starting Nginx remove (stream)...")
 	cmd := exec.CommandContext(r.Context(), "bash", "-c",
-		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/uninstall-nginx.sh | bash -s -- -y`)
+		`set -e
+curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/uninstall-nginx.sh | bash -s -- -y
+if [ -x /usr/local/nginx/sbin/nginx ]; then
+    echo "ERROR: /usr/local/nginx/sbin/nginx 仍然存在" >&2
+    exit 1
+fi
+if command -v nginx >/dev/null 2>&1; then
+    echo "ERROR: MMWX Nginx 已清理，但系统仍存在其他 Nginx: $(command -v nginx)；请用系统包管理器卸载后刷新" >&2
+    exit 1
+fi`)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Nginx removed successfully")
 }
