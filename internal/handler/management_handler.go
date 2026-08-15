@@ -5834,21 +5834,25 @@ dl() { # dl <url> <outfile>
 }
 # 二进制与同名 .sig 签名必须来自【同一镜像】,两者都成功才算该镜像可用。
 download_ok=0
+SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
 for url in "${MIRRORS[@]}"; do
     echo "Downloading from $url ..."
     if dl "$url" "$AGENT_NEW" && dl "${url}.sig" "$AGENT_SIG" && dl "${url}.manifest" "$MANIFEST_NEW"; then
-        download_ok=1
-        break
+        if "$SELF_BIN" __verify-update "$AGENT_NEW" "$AGENT_SIG"; then
+            download_ok=1
+            break
+        fi
+        echo "  → 该镜像的 Agent 与签名不匹配,可能正在发布切换,尝试下一个..."
+        continue
     fi
     echo "  → 该镜像失败(二进制或签名缺失),尝试下一个..."
 done
 if [ "$download_ok" != "1" ]; then
-    echo "ERROR: 所有镜像均下载失败(二进制或签名不可达)" >&2
+    echo "ERROR: 所有镜像均下载或验签失败(二进制、签名或 manifest 不可用)" >&2
     exit 1
 fi
 
 guard_download_ok=0
-SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
 for url in "${GUARD_MIRRORS[@]}"; do
     echo "Downloading Agent Guard from $url ..."
     if dl "$url" "$GUARD_NEW" && dl "${url}.sig" "$GUARD_SIG" && \
