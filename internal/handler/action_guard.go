@@ -20,7 +20,7 @@ func (h *ManageHandler) HandleActionGuardAttest(w http.ResponseWriter, r *http.R
 		return
 	}
 	var request guardclient.AttestationRequest
-	if json.NewDecoder(r.Body).Decode(&request) != nil || request.ServerHash != hashServerToken(h.configToken) {
+	if json.NewDecoder(r.Body).Decode(&request) != nil || request.ServerHash != h.currentServerHash() {
 		writeActionGuardError(w, http.StatusBadRequest, "Action Guard 请求与当前服务器不匹配")
 		return
 	}
@@ -30,6 +30,25 @@ func (h *ManageHandler) HandleActionGuardAttest(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, attestation)
+}
+
+func (h *ManageHandler) HandleActionGuardStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeActionGuardError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	expected := h.currentServerHash()
+	if h.leaseManager == nil {
+		writeActionGuardError(w, http.StatusServiceUnavailable, "Agent authoritative slot manager 未启用")
+		return
+	}
+	status := h.leaseManager.Status()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"expected_server_hash": expected,
+		"slot":                 status,
+		"matches":              status.ServerHash != "" && status.ServerHash == expected,
+		"needs_lease":          h.leaseManager.NeedsLease(),
+	})
 }
 
 func (h *ManageHandler) HandleActionGuardConsume(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +61,7 @@ func (h *ManageHandler) HandleActionGuardConsume(w http.ResponseWriter, r *http.
 		return
 	}
 	var request guardclient.ConsumeRequest
-	if json.NewDecoder(r.Body).Decode(&request) != nil || request.ServerHash != hashServerToken(h.configToken) || strings.TrimSpace(request.Grant) == "" {
+	if json.NewDecoder(r.Body).Decode(&request) != nil || request.ServerHash != h.currentServerHash() || strings.TrimSpace(request.Grant) == "" {
 		writeActionGuardError(w, http.StatusBadRequest, "ActionGrant 与当前服务器不匹配")
 		return
 	}

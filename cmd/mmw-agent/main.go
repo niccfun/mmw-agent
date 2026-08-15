@@ -468,6 +468,7 @@ func main() {
 	if leaseManager != nil {
 		agentClient.SetLeaseManager(leaseManager)
 	}
+	agentClient.SetTokenUpdateHandler(manageHandler.UpdateConfigToken)
 	manageHandler.OnMasterURLChanged(agentClient.ApplyMasterURL)
 	manageHandler.OnProbeMasterURL(agentClient.ProbeMasterURL)
 	if embeddedXray != nil {

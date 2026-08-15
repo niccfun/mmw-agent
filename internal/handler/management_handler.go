@@ -40,6 +40,7 @@ var nginxInstalling atomic.Bool
 
 // ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
+	configTokenMu  sync.RWMutex
 	configToken    string
 	configPath     string
 	restartMethod  string
@@ -80,7 +81,18 @@ func (h *ManageHandler) SetLogPath(p string) { h.logPath = p }
 // SetXrayAccessLogPath 注入内嵌 xray 的 access log 文件路径。
 func (h *ManageHandler) SetXrayAccessLogPath(p string) { h.xrayAccessLogPath = p }
 
-func (h *ManageHandler) SetActionGuard(client *guardclient.Client)     { h.actionGuard = client }
+func (h *ManageHandler) SetActionGuard(client *guardclient.Client) { h.actionGuard = client }
+func (h *ManageHandler) UpdateConfigToken(token string) {
+	h.configTokenMu.Lock()
+	h.configToken = token
+	h.configTokenMu.Unlock()
+}
+
+func (h *ManageHandler) currentServerHash() string {
+	h.configTokenMu.RLock()
+	defer h.configTokenMu.RUnlock()
+	return hashServerToken(h.configToken)
+}
 func (h *ManageHandler) SetLeaseManager(manager *licenselease.Manager) { h.leaseManager = manager }
 
 // 创建管理处理器。

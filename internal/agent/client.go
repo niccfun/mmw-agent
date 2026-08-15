@@ -147,6 +147,7 @@ type Client struct {
 	// onXrayAuthChange 由 main.go 注入:主控下发的许可证配额授权变化时调用(true=授权→确保 xray 运行,
 	// false=超额→停 xray)。Client 不直接持 ManageHandler 引用,故用回调解耦(仿 onWSConnected 范式)。
 	onXrayAuthChange  func(authorized bool)
+	onTokenUpdated    func(string)
 	lastMasterContact atomic.Int64
 	recoveryActivated atomic.Bool
 }
@@ -160,6 +161,10 @@ func (c *Client) SetXrayAuthHandler(fn func(authorized bool)) {
 // use it as the sole authority for Xray and PRO feature decisions.
 func (c *Client) SetLeaseManager(manager *licenselease.Manager) {
 	c.leaseManager = manager
+}
+
+func (c *Client) SetTokenUpdateHandler(fn func(string)) {
+	c.onTokenUpdated = fn
 }
 
 // SetListenGateHooks 注入"端口隐身"钩子(见 onWSConnected / onWSDisconnected 字段)。
@@ -2300,13 +2305,20 @@ func runCmd(name string, args ...string) error {
 func (c *Client) handleTokenUpdate(payload WSTokenUpdatePayload) {
 	log.Printf("[Agent] Received token update from master, new token expires at %s", payload.ExpiresAt.Format(time.RFC3339))
 
-	// 更新内存中的 token
+	if err := c.persistConfigField("token", payload.ServerToken); err != nil {
+		log.Printf("[Agent] Failed to persist rotated token: %v", err)
+	}
 	c.config.Token = payload.ServerToken
+	if c.onTokenUpdated != nil {
+		c.onTokenUpdated(payload.ServerToken)
+	}
 	if c.leaseManager != nil {
-		c.leaseManager.UpdateServerToken(payload.ServerToken)
+		if err := c.leaseManager.UpdateServerToken(payload.ServerToken); err != nil {
+			log.Printf("[Agent] Failed to invalidate stale authoritative slot: %v", err)
+		}
 	}
 
-	log.Printf("[Agent] Token updated successfully in memory")
+	log.Printf("[Agent] Token updated and stale authoritative slot invalidated")
 }
 
 // 处理主控端下发的限速配置。

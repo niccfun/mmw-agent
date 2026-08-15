@@ -2,8 +2,11 @@ package licenselease
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +24,7 @@ type Manager struct {
 	guard         guardAuthority
 	statePath     string
 	status        guardclient.SlotStatus
+	serverHash    string
 	nextRefresh   time.Time
 	lastEffective bool
 	onChange      func(bool)
@@ -34,24 +38,66 @@ type guardAuthority interface {
 	ReleaseSlot(context.Context) error
 }
 
-func New(_ string, statePath, _ string, guard guardAuthority) (*Manager, error) {
+func New(_ string, statePath, serverToken string, guard guardAuthority) (*Manager, error) {
 	if guard == nil || !guard.Enabled() {
 		return nil, errors.New("Agent Guard is required for authoritative server slots")
 	}
-	m := &Manager{guard: guard, statePath: statePath}
+	m := &Manager{guard: guard, statePath: statePath, serverHash: hashServerToken(serverToken)}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if status, err := guard.SlotStatus(ctx); err == nil {
-		m.applyStatus(status)
+		if m.slotMatchesToken(status) {
+			m.applyStatus(status)
+		} else if err := guard.ReleaseSlot(ctx); err != nil {
+			return nil, errors.New("release stale authoritative slot: " + err.Error())
+		}
 	}
 	return m, nil
 }
 
 func (m *Manager) Required() bool { return true }
 
-func (m *Manager) UpdateServerToken(_ string) {
-	// The server hash is signed into the reservation and lease. The open Agent
-	// cannot rewrite it by changing a local token field.
+func (m *Manager) UpdateServerToken(token string) error {
+	newHash := hashServerToken(token)
+	m.mu.Lock()
+	m.serverHash = newHash
+	status := m.status
+	m.mu.Unlock()
+	if m.slotMatchesToken(status) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.guard.ReleaseSlot(ctx); err != nil {
+		return errors.New("release stale authoritative slot: " + err.Error())
+	}
+	m.applyStatus(guardclient.SlotStatus{})
+	_ = os.Remove(m.statePath)
+	return nil
+}
+
+func (m *Manager) Status() guardclient.SlotStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status
+}
+
+func (m *Manager) ServerHash() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.serverHash
+}
+
+func (m *Manager) slotMatchesToken(status guardclient.SlotStatus) bool {
+	if status.ServerHash == "" {
+		return !status.Authorized && !status.Renewable && status.SlotID == 0
+	}
+	return status.ServerHash == m.ServerHash()
+}
+
+func hashServerToken(token string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(token)))
+	return hex.EncodeToString(sum[:])
 }
 
 func (m *Manager) SetAuthorizationHandler(fn func(bool)) {

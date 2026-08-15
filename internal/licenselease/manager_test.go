@@ -115,3 +115,40 @@ func TestManagerRequestsNewReservationAfterGraceIsExhausted(t *testing.T) {
 		t.Fatal("exhausted Guard grace did not request a fresh reservation")
 	}
 }
+
+func TestManagerReleasesSlotSignedForPreviousTokenOnStartup(t *testing.T) {
+	fake := &fakeGuard{status: guardclient.SlotStatus{
+		Authorized: true, Renewable: true, ServerHash: hashServerToken("old-token"),
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}}
+	manager, err := New("identity", filepath.Join(t.TempDir(), "state"), "new-token", fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.released != 1 {
+		t.Fatalf("stale slot release count = %d, want 1", fake.released)
+	}
+	if !manager.NeedsLease() || manager.Authorized() {
+		t.Fatal("manager did not request a replacement lease after stale slot release")
+	}
+}
+
+func TestManagerReleasesSlotWhenServerTokenRotates(t *testing.T) {
+	fake := &fakeGuard{status: guardclient.SlotStatus{
+		Authorized: true, Renewable: true, ServerHash: hashServerToken("old-token"),
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}}
+	manager, err := New("identity", filepath.Join(t.TempDir(), "state"), "old-token", fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.UpdateServerToken("new-token"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.released != 1 {
+		t.Fatalf("rotated-token slot release count = %d, want 1", fake.released)
+	}
+	if manager.ServerHash() != hashServerToken("new-token") || !manager.NeedsLease() {
+		t.Fatal("manager retained the previous token slot after rotation")
+	}
+}
