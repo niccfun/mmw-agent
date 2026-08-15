@@ -48,11 +48,13 @@ log "架构: $ARCH_NAME"
 # 2. 解析目标版本 path(URL 前缀由镜像链各自接上)
 if [ "$TARGET" = "latest" ]; then
     PATH_SUFFIX="releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    GUARD_PATH_SUFFIX="releases/latest/download/mmwx-guardd-agent-linux-${ARCH_NAME}"
     log "目标: latest（R2 CDN 优先，GitHub 回退）"
 else
     # 允许带或不带 v 前缀
     case "$TARGET" in v*) TAG="$TARGET" ;; *) TAG="v$TARGET" ;; esac
     PATH_SUFFIX="releases/download/${TAG}/mmw-agent-linux-${ARCH_NAME}"
+    GUARD_PATH_SUFFIX="releases/download/${TAG}/mmwx-guardd-agent-linux-${ARCH_NAME}"
     log "目标: $TAG"
 fi
 
@@ -71,6 +73,8 @@ MIRRORS=(
 )
 GUARD_MIRRORS=(
     "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-agent-linux-${ARCH_NAME}"
+    "https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
+    "https://gh-proxy.com/https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
 )
 if [ -n "$AGENT_ASSET_BASE" ]; then
     MIRRORS=("${AGENT_ASSET_BASE%/}/mmw-agent-linux-${ARCH_NAME}")
@@ -129,23 +133,37 @@ verify_update_file() {
     fi
     return 1
 }
+
+# CDN 边缘节点偶尔会在 TLS/HTTP2 连接阶段提前断开。每个文件在切换镜像前
+# 原地重试三次；不使用较新的 curl --retry-all-errors，兼容旧发行版。
+download_file() {
+    local url="$1" output="$2" max_time="$3" attempt
+    for attempt in 1 2 3; do
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSL --connect-timeout 10 --max-time "$max_time" -o "$output" "$url"; then
+                return 0
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if wget -q --connect-timeout=10 --read-timeout="$max_time" -O "$output" "$url"; then
+                return 0
+            fi
+        else
+            err "没有 curl/wget,无法下载"
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            log "  → 下载中断，2 秒后重试($attempt/3)..."
+            sleep 2
+        fi
+    done
+    return 1
+}
 download_ok=0
 for URL in "${MIRRORS[@]}"; do
     log "下载 $URL ..."
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --connect-timeout 10 --max-time 180 -o "$TMP" "$URL" && \
-           curl -fsSL --connect-timeout 10 --max-time 60 -o "$TMP.sig" "${URL}.sig" && \
-           curl -fsSL --connect-timeout 10 --max-time 60 -o "$MANIFEST_TMP" "${URL}.manifest"; then
-            download_ok=1; break
-        fi
-    elif command -v wget >/dev/null 2>&1; then
-        if wget -q --connect-timeout=10 --read-timeout=180 -O "$TMP" "$URL" && \
-           wget -q --connect-timeout=10 --read-timeout=60 -O "$TMP.sig" "${URL}.sig" && \
-           wget -q --connect-timeout=10 --read-timeout=60 -O "$MANIFEST_TMP" "${URL}.manifest"; then
-            download_ok=1; break
-        fi
-    else
-        err "没有 curl/wget,无法下载"
+    if download_file "$URL" "$TMP" 180 && \
+       download_file "${URL}.sig" "$TMP.sig" 60 && \
+       download_file "${URL}.manifest" "$MANIFEST_TMP" 60; then
+        download_ok=1; break
     fi
     log "  → 该镜像失败,尝试下一个..."
 done
@@ -166,17 +184,12 @@ log "✅ Agent 签名校验通过"
 guard_download_ok=0
 for URL in "${GUARD_MIRRORS[@]}"; do
     log "下载 Agent Guard $URL ..."
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --connect-timeout 10 --max-time 180 -o "$GUARD_TMP" "$URL" && \
-           curl -fsSL --connect-timeout 10 --max-time 60 -o "$GUARD_TMP.sig" "${URL}.sig" && \
-           verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
-            guard_download_ok=1; break
-        fi
-    elif wget -q --connect-timeout=10 --read-timeout=180 -O "$GUARD_TMP" "$URL" && \
-         wget -q --connect-timeout=10 --read-timeout=60 -O "$GUARD_TMP.sig" "${URL}.sig" && \
-         verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
+    if download_file "$URL" "$GUARD_TMP" 180 && \
+       download_file "${URL}.sig" "$GUARD_TMP.sig" 60 && \
+       verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
         guard_download_ok=1; break
     fi
+    log "  → 该 Guard 镜像失败，尝试下一个..."
 done
 [ "$guard_download_ok" = "1" ] || err "Agent Guard 或签名下载失败，未替换任何二进制"
 if ! verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
