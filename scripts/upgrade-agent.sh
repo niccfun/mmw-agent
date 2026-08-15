@@ -24,6 +24,12 @@ GUARD_DOWNLOAD_BASE="${MMWX_GUARD_DOWNLOAD_BASE:-}"
 GUARD_RELEASE="${MMWX_GUARD_RELEASE:-}"
 BAK=""
 
+# 与 internal/selfupdate 使用同一离线 Ed25519 根公钥。当前 Agent 缺失或旧版
+# 不支持 __verify-update 时，由 OpenSSL 完成引导验签，不能让待升级文件自证。
+UPDATE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA3aGta5gVWH1jVUInTJopAT7xB8soc4A8FgGEgHrVq6k=
+-----END PUBLIC KEY-----'
+
 err() { echo "[ERROR] $*" >&2; exit 1; }
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
@@ -42,13 +48,11 @@ log "架构: $ARCH_NAME"
 # 2. 解析目标版本 path(URL 前缀由镜像链各自接上)
 if [ "$TARGET" = "latest" ]; then
     PATH_SUFFIX="releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    GUARD_PATH_SUFFIX="releases/latest/download/mmwx-guardd-agent-linux-${ARCH_NAME}"
     log "目标: latest（R2 CDN 优先，GitHub 回退）"
 else
     # 允许带或不带 v 前缀
     case "$TARGET" in v*) TAG="$TARGET" ;; *) TAG="v$TARGET" ;; esac
     PATH_SUFFIX="releases/download/${TAG}/mmw-agent-linux-${ARCH_NAME}"
-    GUARD_PATH_SUFFIX="releases/download/${TAG}/mmwx-guardd-agent-linux-${ARCH_NAME}"
     log "目标: $TAG"
 fi
 
@@ -67,9 +71,6 @@ MIRRORS=(
 )
 GUARD_MIRRORS=(
     "https://dl.miaomiaowux.com/mmwx-guard/mmwx-guardd-agent-linux-${ARCH_NAME}"
-    "https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
-    "https://gh-proxy.com/https://github.com/${REPO}/${GUARD_PATH_SUFFIX}"
-    "https://license.miaomiaowux.com/downloads/mmwx-guardd-agent-linux-${ARCH_NAME}"
 )
 if [ -n "$AGENT_ASSET_BASE" ]; then
     MIRRORS=("${AGENT_ASSET_BASE%/}/mmw-agent-linux-${ARCH_NAME}")
@@ -92,7 +93,42 @@ case "$AVAILABLE_KB" in ''|*[!0-9]*) err "无法检查升级暂存目录可用�
 TMP="$(mktemp "$STAGING_DIR/mmw-agent-new.XXXXXX")"
 GUARD_TMP="$(mktemp "$STAGING_DIR/mmwx-guardd-new.XXXXXX")"
 MANIFEST_TMP="$(mktemp "$STAGING_DIR/mmw-agent-new-manifest.XXXXXX")"
-trap 'rm -f "$TMP" "$TMP.sig" "$GUARD_TMP" "$GUARD_TMP.sig" "$MANIFEST_TMP"' EXIT
+VERIFY_PUBKEY="$(mktemp "$STAGING_DIR/update-public-key.XXXXXX")"
+printf '%s\n' "$UPDATE_PUBLIC_KEY_PEM" > "$VERIFY_PUBKEY"
+chmod 0600 "$VERIFY_PUBKEY"
+trap 'rm -f "$TMP" "$TMP.sig" "$GUARD_TMP" "$GUARD_TMP.sig" "$MANIFEST_TMP" "$VERIFY_PUBKEY"' EXIT
+
+# 优先复用已安装 Agent 的验签实现；缺失、损坏或版本过旧时，回退到系统
+# OpenSSL。后者直接使用固定根公钥，避免首次修复时依赖不存在的 $BIN。
+verify_update_file() {
+    local file="$1" sig="$2" verifier rc
+    for verifier in "$BIN" /usr/local/bin/agent-mmwx /usr/local/bin/mmwx-agent; do
+        [ -x "$verifier" ] || continue
+        # 更早的 Agent 会忽略未知参数并直接启动常驻进程。先检查能力标记，
+        # 避免把验签探测拖到 timeout，也避免短暂启动第二个 Agent 实例。
+        if ! grep -aFq '__verify-update' "$verifier" 2>/dev/null; then
+            continue
+        fi
+        set +e
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 15 "$verifier" __verify-update "$file" "$sig" >/dev/null 2>&1
+        else
+            "$verifier" __verify-update "$file" "$sig" >/dev/null 2>&1
+        fi
+        rc=$?
+        set -e
+        if [ "$rc" = 0 ]; then
+            return 0
+        fi
+        log "[WARN] 已安装 Agent 无法完成验签($verifier, rc=$rc)，尝试 OpenSSL"
+    done
+    if command -v openssl >/dev/null 2>&1 && \
+       openssl pkeyutl -verify -pubin -inkey "$VERIFY_PUBKEY" -rawin \
+           -in "$file" -sigfile "$sig" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
 download_ok=0
 for URL in "${MIRRORS[@]}"; do
     log "下载 $URL ..."
@@ -119,26 +155,12 @@ NEW_MD5=$(md5sum "$TMP" | awk '{print $1}')
 log "下载完成: $SIZE, md5=$NEW_MD5"
 
 # 3b. 签名校验:二进制、.sig 和 manifest 已从同一镜像取得，避免 CDN 发布
-#     切换期间混用不同版本。用【已装】agent 的内嵌公钥验签。
-#     - rc=0  通过 → 继续
-#     - rc=1  新版 agent 明确判定签名不匹配 → 中止(防被篡改/MITM 的二进制)
-#     - 其它  当前是旧版 agent(不支持 __verify-update)或拿不到 .sig → 警告后继续(过渡期兼容)
+#     切换期间混用不同版本。验签失败时 fail closed，不替换现有文件。
 SIG="$TMP.sig"
-if [ -s "$SIG" ] && [ -x "$BIN" ] && command -v timeout >/dev/null 2>&1; then
-    log "校验签名..."
-    set +e
-    VOUT=$(timeout 15 "$BIN" __verify-update "$TMP" "$SIG" 2>&1); VRC=$?
-    set -e
-    if [ "$VRC" = 0 ]; then
-        log "✅ 签名校验通过"
-    elif [ "$VRC" = 1 ]; then
-        err "签名校验失败(二进制与签名不匹配,拒绝升级): $VOUT"
-    else
-        log "[WARN] 无法验签(rc=$VRC,可能当前为旧版 agent 不支持),按原流程继续"
-    fi
-else
-    log "[WARN] 未获取到 .sig 或环境不支持,跳过验签"
-fi
+[ -s "$SIG" ] || err "Agent 签名文件为空，拒绝升级"
+log "校验 Agent 签名..."
+verify_update_file "$TMP" "$SIG" || err "Agent 签名校验失败或系统缺少可用验签器，未替换任何二进制"
+log "✅ Agent 签名校验通过"
 
 # Guard 与 Agent 必须作为同一个升级单元。任何一个下载/验签失败都不替换现有文件。
 guard_download_ok=0
@@ -147,17 +169,17 @@ for URL in "${GUARD_MIRRORS[@]}"; do
     if command -v curl >/dev/null 2>&1; then
         if curl -fsSL --connect-timeout 10 --max-time 180 -o "$GUARD_TMP" "$URL" && \
            curl -fsSL --connect-timeout 10 --max-time 60 -o "$GUARD_TMP.sig" "${URL}.sig" && \
-           "$BIN" __verify-update "$GUARD_TMP" "$GUARD_TMP.sig"; then
+           verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
             guard_download_ok=1; break
         fi
     elif wget -q --connect-timeout=10 --read-timeout=180 -O "$GUARD_TMP" "$URL" && \
          wget -q --connect-timeout=10 --read-timeout=60 -O "$GUARD_TMP.sig" "${URL}.sig" && \
-         "$BIN" __verify-update "$GUARD_TMP" "$GUARD_TMP.sig"; then
+         verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
         guard_download_ok=1; break
     fi
 done
 [ "$guard_download_ok" = "1" ] || err "Agent Guard 或签名下载失败，未替换任何二进制"
-if ! "$BIN" __verify-update "$GUARD_TMP" "$GUARD_TMP.sig"; then
+if ! verify_update_file "$GUARD_TMP" "$GUARD_TMP.sig"; then
     err "Agent Guard 签名校验失败，未替换任何二进制"
 fi
 chmod 0755 "$TMP" "$GUARD_TMP"
