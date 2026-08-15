@@ -3,6 +3,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -745,11 +747,15 @@ func (c *Client) authenticateMode(conn *websocket.Conn, probe bool) error {
 		"same_host_as_master": c.sameHostAsMaster(), // 主控同机 → 前端可显示「反代主控」入口
 		"agent_version":       version.Version,      // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
 		"agent_needs_lease":   c.agentNeedsLease(),
+		"min_master_version":  "0.4.8-beta.12",
+		"control_protocol":    2,
 		"xray_mode":           c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
 		"capabilities": map[string]bool{
 			"rpc":               rpcAvailable,
 			"stream":            rpcAvailable,
 			"return_route_test": rpcAvailable,
+			"lease_ack":         true,
+			"limiter_ack":       true,
 		},
 	})
 
@@ -983,6 +989,7 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 	}
 
 	if c.embeddedXray != nil {
+		payloadMap["connection_count_ready"] = c.embeddedXray.ConnectionCountReady()
 		onlineUsers := c.collectOnlineUsers()
 		if len(onlineUsers) > 0 {
 			payloadMap["online_users"] = onlineUsers
@@ -1481,6 +1488,16 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 		},
 	}
 
+	// HTTP/pull 与 WS 上报相同的连接快照及明确的就绪状态。空 map 也会发送，
+	// 让主控清除上一轮连接数，而不是把缺失字段误解为仍沿用旧值。
+	if c.embeddedXray != nil {
+		payloadMap["connection_count_ready"] = c.embeddedXray.ConnectionCountReady()
+		if l := c.embeddedXray.GetLimiter(); l != nil {
+			payloadMap["conn_counts"] = l.ConnCountSnapshot()
+			payloadMap["node_conn_counts"] = l.NodeConnCountSnapshot()
+		}
+	}
+
 	// 伪装探针真数据:与 sendTrafficData(WS 路径)完全一致。
 	// 这段之前只写在 WS 路径里,HTTP/pull 模式的服务器在伪装页上就只剩流量和网速,
 	// CPU/内存/硬盘/延迟全缺 —— 主控那边的 ring 根本收不到数据。
@@ -1584,6 +1601,9 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	if hbResp.AgentLease != nil && c.leaseManager != nil {
 		if err := c.leaseManager.HandleDelivery(*hbResp.AgentLease); err != nil {
 			log.Printf("[Agent] Rejected signed Agent lease from heartbeat: %v", err)
+		} else if c.embeddedXray != nil {
+			// HTTP 模式没有 lease ACK 消息处理器；租约激活后必须在本地重放此前缓存的配置。
+			c.embeddedXray.ReplayLimiterConfigs(c.HasProFeature("limiter"))
 		}
 	}
 
@@ -2065,6 +2085,8 @@ const (
 	WSMsgTypeLimiterConfig       = "limiter_config"
 	WSMsgTypeLicenseStatus       = "license_status"
 	WSMsgTypeAgentLease          = "agent_lease"
+	WSMsgTypeAgentLeaseAck       = "agent_lease_ack"
+	WSMsgTypeLimiterConfigAck    = "limiter_config_ack"
 	WSMsgTypeConfigUpdate        = "config_update"
 	WSMsgTypeRPCCall             = "rpc_call"        // master 反向 RPC 请求(替代 /api/child/* HTTP)
 	WSMsgTypeRPCReply            = "rpc_reply"       // agent 执行后返回响应(流式调用也用它作 end 帧)
@@ -2100,6 +2122,10 @@ type WSLimiterConfigPayload struct {
 	NodeLimit      uint64                        `json:"node_limit"`
 	Users          []WSUserLimitInfo             `json:"users"`
 	AutoSpeedRules []embedded.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
+	Generation     string                        `json:"generation,omitempty"`
+	Checksum       string                        `json:"checksum,omitempty"`
+	ConfigCount    int                           `json:"config_count,omitempty"`
+	TrackingOnly   bool                          `json:"tracking_only,omitempty"`
 }
 
 // WSUserLimitInfo 是单个用户的限速和连接数配置。
@@ -2192,7 +2218,20 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			log.Printf("[Agent] Failed to parse limiter_config payload: %v", err)
 			return
 		}
-		c.handleLimiterConfig(payload)
+		if payload.Checksum != "" && !validLimiterChecksum(payload) {
+			log.Printf("[Agent] Rejected limiter_config checksum mismatch generation=%s inbound=%s", payload.Generation, payload.InboundTag)
+			c.sendControlAck(conn, WSMsgTypeLimiterConfigAck, map[string]any{
+				"generation": payload.Generation, "checksum": payload.Checksum,
+				"inbound_tag": payload.InboundTag, "applied": false, "error": "checksum mismatch",
+			})
+			return
+		}
+		applied := c.handleLimiterConfig(payload)
+		c.sendControlAck(conn, WSMsgTypeLimiterConfigAck, map[string]any{
+			"generation": payload.Generation, "checksum": payload.Checksum,
+			"inbound_tag": payload.InboundTag, "applied": applied,
+			"pending_lease": !payload.TrackingOnly && !c.HasProFeature("limiter"),
+		})
 	case WSMsgTypeLicenseStatus:
 		var payload LicenseStatus
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -2212,9 +2251,20 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 		}
 		if err := c.leaseManager.HandleDelivery(payload); err != nil {
 			log.Printf("[Agent] Rejected signed agent lease: %v", err)
+			c.sendControlAck(conn, WSMsgTypeAgentLeaseAck, map[string]any{"success": false, "error": err.Error()})
 			return
 		}
-		log.Printf("[Agent] Signed agent lease accepted")
+		replayed := 0
+		generation := ""
+		if c.embeddedXray != nil {
+			replayed = c.embeddedXray.ReplayLimiterConfigs(c.HasProFeature("limiter"))
+			generation = c.embeddedXray.LimiterGeneration()
+		}
+		c.sendControlAck(conn, WSMsgTypeAgentLeaseAck, map[string]any{
+			"success": true, "server_hash": c.leaseManager.ServerHash(),
+			"replayed_configs": replayed, "generation": generation,
+		})
+		log.Printf("[Agent] Signed agent lease accepted; replayed %d limiter configs", replayed)
 	case WSMsgTypeConfigUpdate:
 		var payload map[string]string
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -2343,53 +2393,62 @@ func (c *Client) HasProFeature(name string) bool {
 	return c.licenseStatus.HasFeature(name)
 }
 
-func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
-	if c.embeddedXray == nil {
-		log.Printf("[Agent] Ignoring limiter_config: not in embedded mode")
+func validLimiterChecksum(payload WSLimiterConfigPayload) bool {
+	expected := payload.Checksum
+	payload.Checksum = ""
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	var canonical map[string]any
+	if json.Unmarshal(data, &canonical) != nil {
+		return false
+	}
+	delete(canonical, "checksum")
+	data, _ = json.Marshal(canonical)
+	sum := sha256.Sum256(data)
+	return strings.EqualFold(expected, hex.EncodeToString(sum[:]))
+}
+
+func (c *Client) sendControlAck(conn *websocket.Conn, messageType string, payload any) {
+	body, err := json.Marshal(payload)
+	if err != nil {
 		return
 	}
-	if !c.HasProFeature("limiter") {
-		log.Printf("[Agent] Ignoring limiter_config: limiter feature not licensed")
-		return
+	if err := c.writeEncrypted(conn, map[string]any{"type": messageType, "payload": json.RawMessage(body)}); err != nil {
+		log.Printf("[Agent] Failed to send %s: %v", messageType, err)
+	}
+}
+
+func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) bool {
+	if c.embeddedXray == nil {
+		log.Printf("[Agent] Ignoring limiter_config: not in embedded mode")
+		return false
 	}
 
 	users := make([]limiter.UserInfo, len(payload.Users))
 	for i, u := range payload.Users {
 		users[i] = limiter.UserInfo{
-			UID:           u.UID,
-			Email:         u.Email,
-			SpeedLimit:    u.SpeedLimit,
-			DeviceLimit:   u.DeviceLimit,
-			ConnGroup:     u.ConnGroup,
-			ConnStatGroup: u.ConnStatGroup,
+			UID: u.UID, Email: u.Email, SpeedLimit: u.SpeedLimit, DeviceLimit: u.DeviceLimit,
+			ConnGroup: u.ConnGroup, ConnStatGroup: u.ConnStatGroup,
 		}
 	}
-
-	l := c.embeddedXray.GetLimiter()
-	if l == nil {
-		return
+	enforce := !payload.TrackingOnly && c.HasProFeature("limiter")
+	ready := c.embeddedXray.ApplyLimiterConfig(embedded.LimiterConfig{
+		InboundTag: payload.InboundTag, NodeLimit: payload.NodeLimit, Users: users,
+		AutoSpeedRules: payload.AutoSpeedRules, Generation: payload.Generation,
+		ExpectedCount: payload.ConfigCount, Enforce: enforce,
+	})
+	if !enforce && !payload.TrackingOnly {
+		log.Printf("[Agent] Cached limiter_config for inbound %s pending signed lease; tracking-only config applied", payload.InboundTag)
 	}
-
-	// 用 Sync 而非 Add:Add 会重建 BucketHub,存量连接持有的旧桶不会被更新,
-	// 改限速对已连上的用户不生效(要等他重连)。见 SyncInboundLimiter 的说明。
-	l.SyncInboundLimiter(payload.InboundTag, payload.NodeLimit, users)
-
-	if monitor := c.embeddedXray.GetSpeedMonitor(); monitor != nil {
-		monitor.SetLimiter(l)
-		if len(payload.AutoSpeedRules) > 0 {
-			monitor.UpdateRules(payload.AutoSpeedRules)
-			log.Printf("[Agent] Updated auto speed rules: %d rules", len(payload.AutoSpeedRules))
-		}
-	}
-
-	// 日志包含每个用户的限速值,便于线上排查"为什么限速不生效"——
-	// 常见原因 1: master 端 SpeedLimitMbps 是 0; 常见原因 2: vision/splice 协议会绕开 RateWriter。
 	var userSpeeds []string
 	for _, u := range users {
 		userSpeeds = append(userSpeeds, fmt.Sprintf("%s=%dB/s", u.Email, u.SpeedLimit))
 	}
-	log.Printf("[Agent] Updated limiter for inbound %s: %d users, node_limit=%d, per-user=[%s]",
-		payload.InboundTag, len(users), payload.NodeLimit, strings.Join(userSpeeds, ","))
+	log.Printf("[Agent] Updated limiter for inbound %s: %d users, node_limit=%d, enforce=%v, ready=%v, generation=%s, per-user=[%s]",
+		payload.InboundTag, len(users), payload.NodeLimit, enforce, ready, payload.Generation, strings.Join(userSpeeds, ","))
+	return ready
 }
 
 // 采集所有 inbound 的在线设备信息。

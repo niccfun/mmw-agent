@@ -67,7 +67,9 @@ jobs:
             --arg tag "$TAG" \
             --arg notes "${NOTES:-}" \
             --arg html_url "${URL:-}" \
-            '{version:$version, tag:$tag, notes:$notes, html_url:$html_url}' > dist/version.json
+            --arg min_master_version "0.4.8-beta.12" \
+            --argjson control_protocol 2 \
+            '{version:$version, tag:$tag, notes:$notes, html_url:$html_url, min_master_version:$min_master_version, control_protocol:$control_protocol}' > dist/version.json
           cat dist/version.json
 
       - name: Upload to R2 (S3-compatible)

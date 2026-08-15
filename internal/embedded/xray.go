@@ -2,8 +2,11 @@ package embedded
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -20,19 +23,80 @@ import (
 	"mmw-agent/internal/limiter"
 )
 
+type LimiterConfig struct {
+	InboundTag     string               `json:"inbound_tag"`
+	NodeLimit      uint64               `json:"node_limit"`
+	Users          []limiter.UserInfo   `json:"users"`
+	AutoSpeedRules []AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
+	Generation     string               `json:"generation,omitempty"`
+	ExpectedCount  int                  `json:"expected_count,omitempty"`
+	Enforce        bool                 `json:"enforce"`
+}
+
 type EmbeddedXray struct {
-	configPath   string
-	instance     *core.Instance
-	dispatcher   *mydispatcher.Dispatcher
-	statsManager stats.Manager
-	speedMonitor *SpeedMonitor
-	mu           sync.RWMutex
+	configPath        string
+	instance          *core.Instance
+	dispatcher        *mydispatcher.Dispatcher
+	statsManager      stats.Manager
+	speedMonitor      *SpeedMonitor
+	limiterConfigs    map[string]LimiterConfig
+	limiterGeneration string
+	limiterExpected   int
+	limiterReceived   map[string]struct{}
+	limiterReady      bool
+	mu                sync.RWMutex
 }
 
 func New(configPath string) *EmbeddedXray {
-	return &EmbeddedXray{
-		configPath:   configPath,
-		speedMonitor: NewSpeedMonitor(),
+	e := &EmbeddedXray{
+		configPath: configPath, speedMonitor: NewSpeedMonitor(),
+		limiterConfigs: make(map[string]LimiterConfig), limiterReceived: make(map[string]struct{}),
+	}
+	e.loadLimiterState()
+	return e
+}
+
+type limiterState struct {
+	Generation string                   `json:"generation"`
+	Expected   int                      `json:"expected"`
+	Configs    map[string]LimiterConfig `json:"configs"`
+}
+
+func (e *EmbeddedXray) limiterStatePath() string {
+	return e.configPath + ".limiter-state.json"
+}
+
+func (e *EmbeddedXray) loadLimiterState() {
+	data, err := os.ReadFile(e.limiterStatePath())
+	if err != nil {
+		return
+	}
+	var state limiterState
+	if json.Unmarshal(data, &state) != nil || len(state.Configs) == 0 {
+		return
+	}
+	e.limiterGeneration = state.Generation
+	e.limiterExpected = state.Expected
+	e.limiterConfigs = state.Configs
+	for tag := range state.Configs {
+		e.limiterReceived[tag] = struct{}{}
+	}
+	log.Printf("[EmbeddedXray] Loaded %d persisted limiter configs (generation=%s)", len(state.Configs), state.Generation)
+}
+
+func (e *EmbeddedXray) persistLimiterStateLocked() {
+	state := limiterState{Generation: e.limiterGeneration, Expected: e.limiterExpected, Configs: cloneLimiterConfigs(e.limiterConfigs)}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	path := e.limiterStatePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err == nil {
+		_ = os.Rename(tmp, path)
 	}
 }
 
@@ -58,7 +122,32 @@ func (e *EmbeddedXray) Start() (retErr error) {
 		return err
 	}
 
+	var d *mydispatcher.Dispatcher
+	if feature := instance.GetFeature(mydispatcher.Type()); feature != nil {
+		d, _ = feature.(*mydispatcher.Dispatcher)
+	}
+	if d == nil || d.Limiter == nil {
+		instance.Close()
+		return fmt.Errorf("embedded dispatcher limiter is unavailable")
+	}
+
+	// Rehydrate the newly-created dispatcher before instance.Start opens any
+	// inbound listener. This removes the restart window where connections were
+	// accepted without identity, counting, or limiter state.
+	e.mu.Lock()
+	e.dispatcher = d
+	configs := cloneLimiterConfigs(e.limiterConfigs)
+	e.limiterReady = false
+	e.mu.Unlock()
+	applyLimiterConfigs(d.Limiter, configs)
+	e.installVisionLimiterHook()
+
 	if err := e.safeInstanceStart(instance); err != nil {
+		e.mu.Lock()
+		if e.dispatcher == d {
+			e.dispatcher = nil
+		}
+		e.mu.Unlock()
 		instance.Close()
 		return err
 	}
@@ -66,17 +155,21 @@ func (e *EmbeddedXray) Start() (retErr error) {
 	e.mu.Lock()
 	e.instance = instance
 	e.statsManager, _ = instance.GetFeature(stats.ManagerType()).(stats.Manager)
-
-	// Get our custom dispatcher for limiter access
-	if d := instance.GetFeature(mydispatcher.Type()); d != nil {
-		e.dispatcher, _ = d.(*mydispatcher.Dispatcher)
-	}
+	e.limiterReady = len(configs) > 0 && e.limiterConfigCompleteLocked()
 	e.mu.Unlock()
 
-	// 注册 vision splice 后的 conn-wrap 钩子,让 xtls-rprx-vision 节点的限速也能生效。
-	// hook 闭包持有 EmbeddedXray 引用,每次 splice 触发时按 email 查 per-user rate.Limiter;
-	// 拿不到 limiter (limit=0 或用户已被踢) 时返回 nil,vision 走原零拷贝路径,无开销。
-	// 重启 mmw-agent 时 instance 重新初始化,旧 limiter 引用会被新 hook 覆盖。
+	e.speedMonitor.SetLimiter(d.Limiter)
+	for _, cfg := range configs {
+		if len(cfg.AutoSpeedRules) > 0 {
+			e.speedMonitor.UpdateRules(cfg.AutoSpeedRules)
+		}
+	}
+
+	log.Printf("[EmbeddedXray] Started successfully (limiter configs=%d, connection_count_ready=%v)", len(configs), e.ConnectionCountReady())
+	return nil
+}
+
+func (e *EmbeddedXray) installVisionLimiterHook() {
 	xproxy.SetVisionLimiterHook(func(email string, rawConn xnet.Conn) xnet.Conn {
 		l := e.GetLimiter()
 		if l == nil {
@@ -85,14 +178,10 @@ func (e *EmbeddedXray) Start() (retErr error) {
 		}
 		bucket := l.LookupBucketByEmail(email)
 		if bucket == nil {
-			// 无限速用户走原零拷贝 splice 路径。这是每条连接热路径,不打日志(默认 VLESS-Vision 协议会刷爆)。
 			return nil
 		}
 		return limiter.NewRateLimitedConn(rawConn, bucket)
 	})
-
-	log.Printf("[EmbeddedXray] Started successfully (vision limiter hook registered)")
-	return nil
 }
 
 func (e *EmbeddedXray) safeNewInstance(pbConfig *core.Config) (inst *core.Instance, err error) {
@@ -126,6 +215,7 @@ func (e *EmbeddedXray) Stop() (retErr error) {
 	e.instance = nil
 	e.dispatcher = nil
 	e.statsManager = nil
+	e.limiterReady = false
 	e.mu.Unlock()
 
 	if instance != nil {
@@ -169,6 +259,137 @@ func (e *EmbeddedXray) GetLimiter() *limiter.Limiter {
 		return e.dispatcher.Limiter
 	}
 	return nil
+}
+
+func cloneLimiterConfigs(source map[string]LimiterConfig) map[string]LimiterConfig {
+	out := make(map[string]LimiterConfig, len(source))
+	for tag, cfg := range source {
+		cfg.Users = append([]limiter.UserInfo(nil), cfg.Users...)
+		cfg.AutoSpeedRules = append([]AutoSpeedLimitRule(nil), cfg.AutoSpeedRules...)
+		out[tag] = cfg
+	}
+	return out
+}
+
+func effectiveLimiterConfig(cfg LimiterConfig) LimiterConfig {
+	if cfg.Enforce {
+		return cfg
+	}
+	cfg.NodeLimit = 0
+	cfg.AutoSpeedRules = nil
+	cfg.Users = append([]limiter.UserInfo(nil), cfg.Users...)
+	for i := range cfg.Users {
+		cfg.Users[i].SpeedLimit = 0
+		cfg.Users[i].DeviceLimit = 0
+	}
+	return cfg
+}
+
+func applyLimiterConfigs(target *limiter.Limiter, configs map[string]LimiterConfig) {
+	if target == nil {
+		return
+	}
+	for _, stored := range configs {
+		cfg := effectiveLimiterConfig(stored)
+		target.SyncInboundLimiter(cfg.InboundTag, cfg.NodeLimit, cfg.Users)
+	}
+}
+
+func (e *EmbeddedXray) limiterConfigCompleteLocked() bool {
+	expected := e.limiterExpected
+	if expected <= 0 {
+		expected = 1
+	}
+	return len(e.limiterReceived) >= expected
+}
+
+// ApplyLimiterConfig caches the full control-plane config outside the Xray
+// instance. When enforce=false it still applies identity/group data with all
+// limits zero, keeping connection statistics independent from the paid limiter.
+func (e *EmbeddedXray) ApplyLimiterConfig(cfg LimiterConfig) bool {
+	if cfg.InboundTag == "" {
+		return false
+	}
+	e.mu.Lock()
+	if cfg.Generation != "" && cfg.Generation != e.limiterGeneration {
+		e.limiterGeneration = cfg.Generation
+		e.limiterExpected = cfg.ExpectedCount
+		e.limiterReceived = make(map[string]struct{})
+	}
+	if cfg.ExpectedCount > 0 {
+		e.limiterExpected = cfg.ExpectedCount
+	}
+	e.limiterReceived[cfg.InboundTag] = struct{}{}
+	e.limiterConfigs[cfg.InboundTag] = cfg
+	if e.limiterConfigCompleteLocked() {
+		for tag := range e.limiterConfigs {
+			if _, current := e.limiterReceived[tag]; !current {
+				delete(e.limiterConfigs, tag)
+			}
+		}
+	}
+	e.persistLimiterStateLocked()
+	d := e.dispatcher
+	running := e.instance != nil
+	e.limiterReady = false
+	e.mu.Unlock()
+
+	if d == nil || d.Limiter == nil {
+		return false
+	}
+	effective := effectiveLimiterConfig(cfg)
+	d.Limiter.SyncInboundLimiter(effective.InboundTag, effective.NodeLimit, effective.Users)
+	e.speedMonitor.SetLimiter(d.Limiter)
+	if len(effective.AutoSpeedRules) > 0 {
+		e.speedMonitor.UpdateRules(effective.AutoSpeedRules)
+	}
+	e.mu.Lock()
+	e.limiterReady = running && e.limiterConfigCompleteLocked()
+	ready := e.limiterReady
+	e.mu.Unlock()
+	return ready
+}
+
+// ReplayLimiterConfigs promotes cached tracking-only configs after lease
+// activation, or restores them into a replacement dispatcher after restart.
+func (e *EmbeddedXray) ReplayLimiterConfigs(enforce bool) int {
+	e.mu.Lock()
+	for tag, cfg := range e.limiterConfigs {
+		cfg.Enforce = enforce
+		e.limiterConfigs[tag] = cfg
+	}
+	e.persistLimiterStateLocked()
+	configs := cloneLimiterConfigs(e.limiterConfigs)
+	d := e.dispatcher
+	running := e.instance != nil
+	e.limiterReady = false
+	e.mu.Unlock()
+	if d == nil || d.Limiter == nil {
+		return 0
+	}
+	applyLimiterConfigs(d.Limiter, configs)
+	e.speedMonitor.SetLimiter(d.Limiter)
+	for _, cfg := range configs {
+		if cfg.Enforce && len(cfg.AutoSpeedRules) > 0 {
+			e.speedMonitor.UpdateRules(cfg.AutoSpeedRules)
+		}
+	}
+	e.mu.Lock()
+	e.limiterReady = running && len(configs) > 0 && e.limiterConfigCompleteLocked()
+	e.mu.Unlock()
+	return len(configs)
+}
+
+func (e *EmbeddedXray) ConnectionCountReady() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.instance != nil && e.limiterReady
+}
+
+func (e *EmbeddedXray) LimiterGeneration() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.limiterGeneration
 }
 
 func (e *EmbeddedXray) UpdateLimiter(tag string, users []limiter.UserInfo) {
@@ -329,7 +550,7 @@ func (e *EmbeddedXray) GetTraffic(name string) int64 {
 }
 
 var (
-	errNotRunning    = &EmbeddedError{"xray instance not running"}
+	errNotRunning     = &EmbeddedError{"xray instance not running"}
 	errInvalidHandler = &EmbeddedError{"created object is not a valid handler"}
 )
 
@@ -338,4 +559,3 @@ type EmbeddedError struct {
 }
 
 func (e *EmbeddedError) Error() string { return e.msg }
-

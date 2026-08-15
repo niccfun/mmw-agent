@@ -6374,44 +6374,37 @@ func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
 		InboundTag string `json:"inbound_tag"`
 		NodeLimit  uint64 `json:"node_limit"`
 		Users      []struct {
-			UID         int    `json:"uid"`
-			Email       string `json:"email"`
-			SpeedLimit  uint64 `json:"speed_limit"`
-			DeviceLimit int    `json:"device_limit"`
+			UID           int    `json:"uid"`
+			Email         string `json:"email"`
+			SpeedLimit    uint64 `json:"speed_limit"`
+			DeviceLimit   int    `json:"device_limit"`
+			ConnGroup     string `json:"conn_group,omitempty"`
+			ConnStatGroup string `json:"conn_stat_group,omitempty"`
 		} `json:"users"`
 		AutoSpeedRules []embedded.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
+		Generation     string                        `json:"generation,omitempty"`
+		Checksum       string                        `json:"checksum,omitempty"`
+		ConfigCount    int                           `json:"config_count,omitempty"`
+		TrackingOnly   bool                          `json:"tracking_only,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-
 	users := make([]limiter.UserInfo, len(req.Users))
 	for i, u := range req.Users {
-		users[i] = limiter.UserInfo{
-			UID:         u.UID,
-			Email:       u.Email,
-			SpeedLimit:  u.SpeedLimit,
-			DeviceLimit: u.DeviceLimit,
-		}
+		users[i] = limiter.UserInfo{UID: u.UID, Email: u.Email, SpeedLimit: u.SpeedLimit, DeviceLimit: u.DeviceLimit, ConnGroup: u.ConnGroup, ConnStatGroup: u.ConnStatGroup}
 	}
-
-	l := h.embeddedXray.GetLimiter()
-	if l == nil {
-		writeError(w, http.StatusInternalServerError, "Limiter not available")
-		return
-	}
-
-	l.AddInboundLimiter(req.InboundTag, req.NodeLimit, users)
-
-	if len(req.AutoSpeedRules) > 0 {
-		if monitor := h.embeddedXray.GetSpeedMonitor(); monitor != nil {
-			monitor.UpdateRules(req.AutoSpeedRules)
-			monitor.SetLimiter(l)
-		}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+	enforce := !req.TrackingOnly && h.leaseManager != nil && h.leaseManager.HasFeature("limiter")
+	ready := h.embeddedXray.ApplyLimiterConfig(embedded.LimiterConfig{
+		InboundTag: req.InboundTag, NodeLimit: req.NodeLimit, Users: users,
+		AutoSpeedRules: req.AutoSpeedRules, Generation: req.Generation,
+		ExpectedCount: req.ConfigCount, Enforce: enforce,
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true, "applied": ready, "pending_lease": !req.TrackingOnly && !enforce,
+		"generation": req.Generation, "checksum": req.Checksum,
+	})
 }
 
 // HandleSwitchXrayMode 处理 POST /api/child/agent/switch-xray-mode。
