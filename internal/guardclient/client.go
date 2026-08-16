@@ -44,13 +44,14 @@ type SlotDelivery struct {
 }
 
 type SlotStatus struct {
-	Authorized bool     `json:"authorized"`
-	Renewable  bool     `json:"renewable,omitempty"`
-	ServerHash string   `json:"server_hash,omitempty"`
-	SlotID     int64    `json:"slot_id,omitempty"`
-	Generation int64    `json:"generation,omitempty"`
-	ExpiresAt  int64    `json:"expires_at,omitempty"`
-	Features   []string `json:"features,omitempty"`
+	Authorized     bool     `json:"authorized"`
+	Renewable      bool     `json:"renewable,omitempty"`
+	ServerHash     string   `json:"server_hash,omitempty"`
+	LicenseKeyHash string   `json:"license_key_hash,omitempty"`
+	SlotID         int64    `json:"slot_id,omitempty"`
+	Generation     int64    `json:"generation,omitempty"`
+	ExpiresAt      int64    `json:"expires_at,omitempty"`
+	Features       []string `json:"features,omitempty"`
 }
 
 type Health struct {

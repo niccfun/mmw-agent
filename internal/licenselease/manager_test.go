@@ -37,7 +37,7 @@ func (f *fakeGuard) ActivateSlot(_ context.Context, delivery guardclient.SlotDel
 	defer f.mu.Unlock()
 	f.activated++
 	f.status = guardclient.SlotStatus{
-		Authorized: true, Renewable: true, ServerHash: "server", SlotID: 7, Generation: 3,
+		Authorized: true, Renewable: true, ServerHash: "server", LicenseKeyHash: "license-identity", SlotID: 7, Generation: 3,
 		ExpiresAt: time.Now().Add(time.Hour).Unix(), Features: []string{"limiter"},
 	}
 	return f.status, nil
@@ -81,6 +81,9 @@ func TestManagerDelegatesSlotAuthorityToGuard(t *testing.T) {
 	}
 	if !manager.Authorized() || !manager.HasFeature("limiter") || manager.NeedsLease() {
 		t.Fatal("Guard status was not applied")
+	}
+	if got := manager.Status().LicenseKeyHash; got != "license-identity" {
+		t.Fatalf("signed license identity was not propagated from Guard: %q", got)
 	}
 	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
 		t.Fatal("legacy open-Agent lease state was not removed")

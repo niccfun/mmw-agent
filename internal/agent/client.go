@@ -739,22 +739,24 @@ func (c *Client) authenticateMode(conn *websocket.Conn, probe bool) error {
 		warpInstalled = c.warpStatusFn()
 	}
 	authPayload, _ := json.Marshal(map[string]any{
-		"token":               c.config.Token,
-		"probe":               probe,
-		"public_ipv4":         publicIPv4,
-		"public_ipv6":         publicIPv6,
-		"warp_installed":      warpInstalled,
-		"same_host_as_master": c.sameHostAsMaster(), // 主控同机 → 前端可显示「反代主控」入口
-		"agent_version":       version.Version,      // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
-		"agent_needs_lease":   c.agentNeedsLease(),
-		"min_master_version":  "0.4.8-beta.12",
-		"control_protocol":    2,
-		"xray_mode":           c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
+		"token":                c.config.Token,
+		"probe":                probe,
+		"public_ipv4":          publicIPv4,
+		"public_ipv6":          publicIPv6,
+		"warp_installed":       warpInstalled,
+		"same_host_as_master":  c.sameHostAsMaster(), // 主控同机 → 前端可显示「反代主控」入口
+		"agent_version":        version.Version,      // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
+		"agent_needs_lease":    c.agentNeedsLease(),
+		"agent_lease_identity": c.agentLeaseIdentity(),
+		"min_master_version":   "0.4.8-beta.12",
+		"control_protocol":     2,
+		"xray_mode":            c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
 		"capabilities": map[string]bool{
 			"rpc":               rpcAvailable,
 			"stream":            rpcAvailable,
 			"return_route_test": rpcAvailable,
 			"lease_ack":         true,
+			"lease_identity":    true,
 			"limiter_ack":       true,
 		},
 	})
@@ -1056,14 +1058,15 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 		warpInstalled = c.warpStatusFn()
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"boot_time":           c.startTime,
-		"listen_port":         listenPort,
-		"local_time":          time.Now().Unix(),
-		"public_ipv4":         publicIPv4,
-		"public_ipv6":         publicIPv6,
-		"warp_installed":      warpInstalled,
-		"same_host_as_master": c.sameHostAsMaster(),
-		"agent_needs_lease":   c.agentNeedsLease(),
+		"boot_time":            c.startTime,
+		"listen_port":          listenPort,
+		"local_time":           time.Now().Unix(),
+		"public_ipv4":          publicIPv4,
+		"public_ipv6":          publicIPv6,
+		"warp_installed":       warpInstalled,
+		"same_host_as_master":  c.sameHostAsMaster(),
+		"agent_needs_lease":    c.agentNeedsLease(),
+		"agent_lease_identity": c.agentLeaseIdentity(),
 	})
 
 	msg := map[string]interface{}{
@@ -1568,12 +1571,14 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	// IPv4-only master 反向请求全部 502。这里跟 WS auth/heartbeat 同款,把后台 ipProbeLoop
 	// 缓存的 v4/v6 一起上报,master 端优先用,fallback 才用 RemoteAddr 并强校验类型。
 	payload, _ := json.Marshal(map[string]interface{}{
-		"boot_time":         c.startTime.Unix(),
-		"listen_port":       listenPort,
-		"local_time":        time.Now().Unix(),
-		"public_ipv4":       c.getPublicIPv4(),
-		"public_ipv6":       c.getPublicIPv6(),
-		"agent_needs_lease": c.agentNeedsLease(),
+		"boot_time":            c.startTime.Unix(),
+		"listen_port":          listenPort,
+		"local_time":           time.Now().Unix(),
+		"public_ipv4":          c.getPublicIPv4(),
+		"public_ipv6":          c.getPublicIPv6(),
+		"agent_needs_lease":    c.agentNeedsLease(),
+		"agent_lease_capable":  c.leaseManager != nil,
+		"agent_lease_identity": c.agentLeaseIdentity(),
 	})
 
 	u, err := url.Parse(c.config.MasterURL)
@@ -2251,7 +2256,9 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 		}
 		if err := c.leaseManager.HandleDelivery(payload); err != nil {
 			log.Printf("[Agent] Rejected signed agent lease: %v", err)
-			c.sendControlAck(conn, WSMsgTypeAgentLeaseAck, map[string]any{"success": false, "error": err.Error()})
+			c.sendControlAck(conn, WSMsgTypeAgentLeaseAck, map[string]any{
+				"success": false, "error": err.Error(), "license_identity": c.agentLeaseIdentity(),
+			})
 			return
 		}
 		replayed := 0
@@ -2262,6 +2269,7 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 		}
 		c.sendControlAck(conn, WSMsgTypeAgentLeaseAck, map[string]any{
 			"success": true, "server_hash": c.leaseManager.ServerHash(),
+			"license_identity": c.agentLeaseIdentity(),
 			"replayed_configs": replayed, "generation": generation,
 		})
 		log.Printf("[Agent] Signed agent lease accepted; replayed %d limiter configs", replayed)
@@ -2782,6 +2790,13 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 
 func (c *Client) agentNeedsLease() bool {
 	return c.leaseManager != nil && c.leaseManager.Required() && c.leaseManager.NeedsLease()
+}
+
+func (c *Client) agentLeaseIdentity() string {
+	if c.leaseManager == nil {
+		return ""
+	}
+	return c.leaseManager.Status().LicenseKeyHash
 }
 
 // handleProbeConfigUpdate 解析伪装探针采集配置(4 子开关 + ping 目标 + 间隔)。
