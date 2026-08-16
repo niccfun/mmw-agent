@@ -42,6 +42,15 @@ type nginxRuntime struct {
 	Reason     string `json:"reason,omitempty"`
 }
 
+var nginxVersionPattern = regexp.MustCompile(`nginx version:\s*nginx/([^\s]+)`)
+
+func parseNginxVersionOutput(output string) string {
+	if match := nginxVersionPattern.FindStringSubmatch(output); len(match) == 2 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
+}
+
 func findNginxBinary() string {
 	for _, bin := range constants.NginxBinarySearchPaths {
 		if p, err := exec.LookPath(bin); err == nil {
@@ -232,9 +241,7 @@ func inspectNginxRuntime() nginxRuntime {
 	rt.Installed = true
 	rt.Manager = detectNginxManager()
 	flags := string(out)
-	if match := regexp.MustCompile(`nginx version:\\s*nginx/([^\\s]+)`).FindStringSubmatch(flags); len(match) == 2 {
-		rt.Version = match[1]
-	}
+	rt.Version = parseNginxVersionOutput(flags)
 	value := func(name string) string {
 		re := regexp.MustCompile(`--` + regexp.QuoteMeta(name) + `=([^\s]+)`)
 		if match := re.FindStringSubmatch(flags); len(match) == 2 {

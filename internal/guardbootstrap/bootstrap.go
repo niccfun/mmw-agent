@@ -193,7 +193,11 @@ func Ensure(ctx context.Context, cfg Config) error {
 	}
 
 	name := "mmwx-guardd-agent-linux-" + runtime.GOARCH
-	tmpDir, err := os.MkdirTemp(tempDir, "mmwx-guard-bootstrap-*")
+	// Use one bounded staging directory instead of a new random directory on
+	// every attempt. A SIGKILL/service restart cannot run defer; with MkdirTemp
+	// that left one full Guard binary per attempt in /tmp. Recreating the fixed
+	// directory removes the interrupted attempt before downloading again.
+	tmpDir, err := prepareBootstrapDir(tempDir)
 	if err != nil {
 		return err
 	}
@@ -298,13 +302,36 @@ func Ensure(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+func prepareBootstrapDir(root string) (string, error) {
+	path := filepath.Join(root, "mmwx-guard-bootstrap")
+	if err := os.RemoveAll(path); err != nil {
+		return "", fmt.Errorf("remove previous Agent Guard bootstrap directory: %w", err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		return "", fmt.Errorf("create Agent Guard bootstrap directory: %w", err)
+	}
+	return path, nil
+}
+
 func cleanupStaleBootstrapDirs(root string, now time.Time, maxAge time.Duration) error {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "mmwx-guard-bootstrap-") {
+		if !entry.IsDir() {
+			continue
+		}
+		// The fixed staging directory belongs to an interrupted earlier Agent
+		// process and is safe to remove immediately. Legacy random directories use
+		// the age guard below for compatibility with an in-flight old Agent.
+		if entry.Name() == "mmwx-guard-bootstrap" {
+			if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+				return err
+			}
+			continue
+		}
+		if !strings.HasPrefix(entry.Name(), "mmwx-guard-bootstrap-") {
 			continue
 		}
 		info, err := entry.Info()

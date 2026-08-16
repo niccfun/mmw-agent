@@ -53,6 +53,37 @@ func TestNginxIncludedServerDir(t *testing.T) {
 	}
 }
 
+func TestParseNginxVersionOutput(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name:   "standard version output",
+			output: "nginx version: nginx/1.31.3\nbuilt by gcc 14.2.0\n",
+			want:   "1.31.3",
+		},
+		{
+			name:   "version with build suffix",
+			output: "nginx version: nginx/1.27.4-custom\n",
+			want:   "1.27.4-custom",
+		},
+		{
+			name:   "unrelated output",
+			output: "command not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseNginxVersionOutput(tt.output); got != tt.want {
+				t.Fatalf("version = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAddNginxManagedIncludeTargetsHTTPBlock(t *testing.T) {
 	original := `events {}
 http {

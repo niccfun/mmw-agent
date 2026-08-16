@@ -67,8 +67,9 @@ func TestCleanupStaleBootstrapDirsPreservesRecentAndUnrelatedEntries(t *testing.
 	now := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 	stale := filepath.Join(root, "mmwx-guard-bootstrap-stale")
 	recent := filepath.Join(root, "mmwx-guard-bootstrap-active")
+	interruptedFixed := filepath.Join(root, "mmwx-guard-bootstrap")
 	unrelated := filepath.Join(root, "another-temp-dir")
-	for _, path := range []string{stale, recent, unrelated} {
+	for _, path := range []string{stale, recent, interruptedFixed, unrelated} {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -88,10 +89,39 @@ func TestCleanupStaleBootstrapDirsPreservesRecentAndUnrelatedEntries(t *testing.
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale bootstrap directory still exists: %v", err)
 	}
+	if _, err := os.Stat(interruptedFixed); !os.IsNotExist(err) {
+		t.Fatalf("fixed bootstrap residue still exists: %v", err)
+	}
 	for _, path := range []string{recent, unrelated} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("preserved directory %s: %v", path, err)
 		}
+	}
+}
+
+func TestPrepareBootstrapDirReusesInterruptedStagingDirectory(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, "mmwx-guard-bootstrap")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "abandoned-guard"), []byte("large partial download"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := prepareBootstrapDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != staging {
+		t.Fatalf("staging path = %q, want %q", got, staging)
+	}
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("interrupted bootstrap files were not cleared: %+v", entries)
 	}
 }
 
