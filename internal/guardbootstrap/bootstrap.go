@@ -36,24 +36,26 @@ const (
 )
 
 type Config struct {
-	SocketPath    string
-	BinaryPath    string
-	StateDir      string
-	ManifestPath  string
-	SystemdDir    string
-	OpenRCDir     string
-	InitSystem    string
-	DownloadBases []string
-	ManifestBases []string
-	TempDir       string
-	Now           func() time.Time
-	StaleMaxAge   time.Duration
-	HTTPClient    *http.Client
-	Verify        func(string, string) error
-	VerifyHealth  func(context.Context, string) error
-	RunSystemctl  func(context.Context, ...string) error
-	RunOpenRC     func(context.Context, string, ...string) error
-	WaitForSocket func(context.Context, string) error
+	SocketPath      string
+	BinaryPath      string
+	StateDir        string
+	ManifestPath    string
+	SystemdDir      string
+	OpenRCDir       string
+	InitSystem      string
+	DownloadBases   []string
+	ManifestBases   []string
+	TempDir         string
+	Now             func() time.Time
+	StaleMaxAge     time.Duration
+	HTTPClient      *http.Client
+	Verify          func(string, string) error
+	VerifyManifest  func(context.Context, string, string, string) error
+	AgentBinaryPath string
+	VerifyHealth    func(context.Context, string) error
+	RunSystemctl    func(context.Context, ...string) error
+	RunOpenRC       func(context.Context, string, ...string) error
+	WaitForSocket   func(context.Context, string) error
 }
 
 func healthyExistingGuard(ctx context.Context, socket string, verify func(context.Context, string) error) bool {
@@ -93,18 +95,19 @@ func EnsureDefault(ctx context.Context) error {
 		return errors.New("Agent Guard requires systemd or OpenRC; reinstall the Agent after installing an init system")
 	}
 	cfg := Config{
-		SocketPath:    defaultSocket,
-		BinaryPath:    defaultBinary,
-		StateDir:      defaultStateDir,
-		ManifestPath:  defaultManifest,
-		SystemdDir:    defaultSystemd,
-		OpenRCDir:     defaultOpenRCDir,
-		InitSystem:    initSystem,
-		DownloadBases: defaultDownloadBases(),
-		ManifestBases: releaseManifestBases(version.Version),
-		HTTPClient:    &http.Client{Timeout: 3 * time.Minute},
-		Verify:        selfupdate.VerifyFile,
-		VerifyHealth:  verifyAgentGuardHealth,
+		SocketPath:     defaultSocket,
+		BinaryPath:     defaultBinary,
+		StateDir:       defaultStateDir,
+		ManifestPath:   defaultManifest,
+		SystemdDir:     defaultSystemd,
+		OpenRCDir:      defaultOpenRCDir,
+		InitSystem:     initSystem,
+		DownloadBases:  defaultDownloadBases(),
+		ManifestBases:  releaseManifestBases(version.Version),
+		HTTPClient:     &http.Client{Timeout: 3 * time.Minute},
+		Verify:         selfupdate.VerifyFile,
+		VerifyManifest: verifyAgentManifest,
+		VerifyHealth:   verifyAgentGuardHealth,
 		RunSystemctl: func(ctx context.Context, args ...string) error {
 			cmd := exec.CommandContext(ctx, "systemctl", args...)
 			if output, err := cmd.CombinedOutput(); err != nil {
@@ -160,9 +163,9 @@ func Ensure(ctx context.Context, cfg Config) error {
 	// boot when the existing Guard is only a few milliseconds behind the Agent.
 	if _, err := os.Stat(cfg.BinaryPath); err == nil && cfg.WaitForSocket != nil {
 		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err = cfg.WaitForSocket(readyCtx, cfg.SocketPath)
+		err = waitForHealthyGuard(readyCtx, cfg.SocketPath, cfg.WaitForSocket, verifyHealth)
 		cancel()
-		if err == nil && verifyHealth(ctx, cfg.SocketPath) == nil {
+		if err == nil {
 			return nil
 		}
 	}
@@ -208,18 +211,40 @@ func Ensure(ctx context.Context, cfg Config) error {
 	if err := downloadSignedPair(ctx, cfg.HTTPClient, cfg.DownloadBases, name, binTmp, sigTmp, cfg.Verify); err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(cfg.BinaryPath), 0o755); err != nil {
+		return err
+	}
+	// /tmp is commonly mounted noexec on hardened hosts. Keep downloads in the
+	// bounded temporary directory, but execute a second signature-verified copy
+	// from the final binary's filesystem, which must be executable for Guard to
+	// run after installation anyway.
+	verifyGuard, err := createSiblingExecutable(binTmp, cfg.BinaryPath)
+	if err != nil {
+		return fmt.Errorf("stage Agent Guard for manifest verification: %w", err)
+	}
+	defer os.Remove(verifyGuard)
+	if err := cfg.Verify(verifyGuard, sigTmp); err != nil {
+		return fmt.Errorf("verify staged Agent Guard: %w", err)
+	}
+	verifyManifest := cfg.VerifyManifest
+	if verifyManifest == nil {
+		verifyManifest = verifyAgentManifest
+	}
+	agentBinaryPath := cfg.AgentBinaryPath
+	if agentBinaryPath == "" {
+		// Verify the exact inode executing this process. The on-disk path may have
+		// been atomically replaced by an older updater while this Agent is still
+		// running; /proc/<pid>/exe remains a readable handle to the real caller.
+		agentBinaryPath = fmt.Sprintf("/proc/%d/exe", os.Getpid())
+	}
 	manifestBases := cfg.ManifestBases
 	if len(manifestBases) == 0 {
 		manifestBases = cfg.DownloadBases
 	}
-	if err := downloadFromBases(ctx, cfg.HTTPClient, manifestBases, "mmw-agent-linux-"+runtime.GOARCH+".manifest", manifestTmp, 64<<10); err != nil {
+	if err := downloadVerifiedManifestFromBases(ctx, cfg.HTTPClient, manifestBases,
+		"mmw-agent-linux-"+runtime.GOARCH+".manifest", manifestTmp, 64<<10,
+		verifyGuard, agentBinaryPath, verifyManifest); err != nil {
 		return fmt.Errorf("download signed Agent release manifest: %w", err)
-	}
-	if err := os.Chmod(binTmp, 0o755); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(cfg.BinaryPath), 0o755); err != nil {
-		return err
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return err
@@ -249,56 +274,133 @@ func Ensure(ctx context.Context, cfg Config) error {
 	} else {
 		_ = os.Remove(manifestBackupPath)
 	}
-	rollback := func() {
-		if hadBinary {
-			_ = copyFile(backupPath, cfg.BinaryPath, 0o755)
-		} else {
-			_ = os.Remove(cfg.BinaryPath)
-		}
-		if hadManifest {
-			_ = copyFile(manifestBackupPath, cfg.ManifestPath, 0o644)
-		} else {
-			_ = os.Remove(cfg.ManifestPath)
-		}
+	guardInitPath, agentDependencyPath := bootstrapInitPaths(cfg, initSystem)
+	guardInitSnapshot, err := snapshotBootstrapFile(guardInitPath)
+	if err != nil {
 		_ = os.Remove(backupPath)
 		_ = os.Remove(manifestBackupPath)
+		return fmt.Errorf("backup Agent Guard init file: %w", err)
 	}
-	if err := installAtomic(binTmp, cfg.BinaryPath); err != nil {
-		rollback()
-		return fmt.Errorf("install Agent Guard: %w", err)
+	agentDependencySnapshot, err := snapshotBootstrapFile(agentDependencyPath)
+	if err != nil {
+		_ = guardInitSnapshot.cleanup()
+		_ = os.Remove(backupPath)
+		_ = os.Remove(manifestBackupPath)
+		return fmt.Errorf("backup Agent Guard dependency file: %w", err)
+	}
+	initFilesAttempted := false
+	rollback := func() (bool, error) {
+		var restoreErrs []error
+		if hadBinary {
+			if err := installAtomic(backupPath, cfg.BinaryPath); err != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("restore Agent Guard binary: %w", err))
+			}
+		} else {
+			if err := os.Remove(cfg.BinaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				restoreErrs = append(restoreErrs, fmt.Errorf("remove new Agent Guard binary: %w", err))
+			}
+		}
+		if hadManifest {
+			if err := installAtomicMode(manifestBackupPath, cfg.ManifestPath, 0o644); err != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("restore Agent manifest: %w", err))
+			}
+		} else {
+			if err := os.Remove(cfg.ManifestPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				restoreErrs = append(restoreErrs, fmt.Errorf("remove new Agent manifest: %w", err))
+			}
+		}
+		if initFilesAttempted {
+			if err := guardInitSnapshot.restore(); err != nil {
+				restoreErrs = append(restoreErrs, fmt.Errorf("restore Agent Guard init file: %w", err))
+			}
+			// Keep the normalized Wants= drop-in while restoring an existing
+			// systemd Guard. Reintroducing a legacy Requires= dependency here would
+			// make the restart below terminate the Agent running this rollback.
+			if initSystem != initSystemd || !hadBinary {
+				if err := agentDependencySnapshot.restore(); err != nil {
+					restoreErrs = append(restoreErrs, fmt.Errorf("restore Agent Guard dependency file: %w", err))
+				}
+			}
+		}
+		if err := errors.Join(restoreErrs...); err != nil {
+			// Keep both backups for manual recovery when automatic restoration did
+			// not complete successfully.
+			return false, err
+		}
+		var cleanupErrs []error
+		for _, path := range []string{
+			backupPath, manifestBackupPath,
+			guardInitSnapshot.backup, agentDependencySnapshot.backup,
+		} {
+			if path == "" {
+				continue
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("remove bootstrap backup %s: %w", path, err))
+			}
+		}
+		return true, errors.Join(cleanupErrs...)
+	}
+	rollbackFailure := func(cause error, serviceAttempted bool) error {
+		var serviceErrs []error
+		if serviceAttempted {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := stopGuardService(stopCtx, cfg, initSystem); err != nil {
+				serviceErrs = append(serviceErrs, fmt.Errorf("stop failed Agent Guard before rollback: %w", err))
+			}
+			cancel()
+			if !hadBinary {
+				disableCtx, disableCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := disableGuardService(disableCtx, cfg, initSystem); err != nil {
+					serviceErrs = append(serviceErrs, fmt.Errorf("disable failed Agent Guard before rollback: %w", err))
+				}
+				disableCancel()
+			}
+		}
+		restored, rollbackErr := rollback()
+		if serviceAttempted && restored {
+			serviceCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if initSystem == initSystemd {
+				if err := cfg.RunSystemctl(serviceCtx, "daemon-reload"); err != nil {
+					serviceErrs = append(serviceErrs, fmt.Errorf("reload restored Agent Guard service: %w", err))
+				}
+			}
+			if hadBinary {
+				err := restartGuardService(serviceCtx, cfg, initSystem)
+				if err != nil {
+					serviceErrs = append(serviceErrs, fmt.Errorf("restart restored Agent Guard: %w", err))
+				}
+			}
+			cancel()
+		}
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("rollback Agent Guard bootstrap: %w", rollbackErr)
+		}
+		return errors.Join(cause, rollbackErr, errors.Join(serviceErrs...))
+	}
+	if err := installAtomic(verifyGuard, cfg.BinaryPath); err != nil {
+		return rollbackFailure(fmt.Errorf("install Agent Guard: %w", err), false)
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.ManifestPath), 0o755); err != nil {
-		rollback()
-		return err
+		return rollbackFailure(err, false)
 	}
-	if err := copyFile(manifestTmp, cfg.ManifestPath, 0o644); err != nil {
-		rollback()
-		return err
+	if err := installAtomicMode(manifestTmp, cfg.ManifestPath, 0o644); err != nil {
+		return rollbackFailure(err, false)
 	}
+	initFilesAttempted = true
 	if err := writeInitFiles(cfg, initSystem); err != nil {
-		rollback()
-		return err
+		return rollbackFailure(err, false)
 	}
 	if err := startGuardService(ctx, cfg, initSystem); err != nil {
-		rollback()
-		return err
+		return rollbackFailure(err, true)
 	}
-	if err := cfg.WaitForSocket(ctx, cfg.SocketPath); err != nil {
-		rollback()
-		if hadBinary {
-			_ = restartGuardService(context.Background(), cfg, initSystem)
-		}
-		return fmt.Errorf("Agent Guard did not become ready: %w", err)
-	}
-	if err := verifyHealth(ctx, cfg.SocketPath); err != nil {
-		rollback()
-		if hadBinary {
-			_ = restartGuardService(context.Background(), cfg, initSystem)
-		}
-		return fmt.Errorf("Agent Guard health check failed: %w", err)
+	if err := waitForHealthyGuard(ctx, cfg.SocketPath, cfg.WaitForSocket, verifyHealth); err != nil {
+		return rollbackFailure(fmt.Errorf("Agent Guard did not become healthy: %w", err), true)
 	}
 	_ = os.Remove(backupPath)
 	_ = os.Remove(manifestBackupPath)
+	_ = guardInitSnapshot.cleanup()
+	_ = agentDependencySnapshot.cleanup()
 	return nil
 }
 
@@ -311,6 +413,84 @@ func prepareBootstrapDir(root string) (string, error) {
 		return "", fmt.Errorf("create Agent Guard bootstrap directory: %w", err)
 	}
 	return path, nil
+}
+
+func createSiblingExecutable(source, installedPath string) (string, error) {
+	dir := filepath.Dir(installedPath)
+	placeholder, err := os.CreateTemp(dir, ".mmwx-guard-verify-*")
+	if err != nil {
+		return "", err
+	}
+	path := placeholder.Name()
+	if err := placeholder.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := installAtomic(source, path); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+type bootstrapFileSnapshot struct {
+	path    string
+	backup  string
+	existed bool
+	mode    os.FileMode
+}
+
+func snapshotBootstrapFile(path string) (bootstrapFileSnapshot, error) {
+	snapshot := bootstrapFileSnapshot{path: path}
+	if path == "" {
+		return snapshot, nil
+	}
+	snapshot.backup = path + ".bootstrap-backup"
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		_ = os.Remove(snapshot.backup)
+		return snapshot, nil
+	}
+	if err != nil {
+		return snapshot, err
+	}
+	snapshot.existed = true
+	snapshot.mode = info.Mode().Perm()
+	if err := copyFile(path, snapshot.backup, snapshot.mode); err != nil {
+		return snapshot, err
+	}
+	return snapshot, nil
+}
+
+func (snapshot bootstrapFileSnapshot) restore() error {
+	if snapshot.path == "" {
+		return nil
+	}
+	if snapshot.existed {
+		return installAtomicMode(snapshot.backup, snapshot.path, snapshot.mode)
+	}
+	if err := os.Remove(snapshot.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (snapshot bootstrapFileSnapshot) cleanup() error {
+	if snapshot.backup == "" {
+		return nil
+	}
+	if err := os.Remove(snapshot.backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func bootstrapInitPaths(cfg Config, initSystem string) (string, string) {
+	if initSystem == initOpenRC {
+		return filepath.Join(cfg.OpenRCDir, guardOpenRCName), ""
+	}
+	return filepath.Join(cfg.SystemdDir, guardServiceName),
+		filepath.Join(cfg.SystemdDir, "mmw-agent.service.d", "action-guard.conf")
 }
 
 func cleanupStaleBootstrapDirs(root string, now time.Time, maxAge time.Duration) error {
@@ -366,7 +546,13 @@ func startGuardService(ctx context.Context, cfg Config, initSystem string) error
 	if err := cfg.RunSystemctl(ctx, "daemon-reload"); err != nil {
 		return err
 	}
-	return cfg.RunSystemctl(ctx, "enable", "--now", guardServiceName)
+	if err := cfg.RunSystemctl(ctx, "enable", guardServiceName); err != nil {
+		return err
+	}
+	// enable --now is a no-op for an already active service. Bootstrap reaches
+	// this path specifically when the running Guard rejected the current Agent,
+	// so it must restart to load the newly installed binary and manifest.
+	return cfg.RunSystemctl(ctx, "restart", guardServiceName)
 }
 
 func restartGuardService(ctx context.Context, cfg Config, initSystem string) error {
@@ -374,6 +560,20 @@ func restartGuardService(ctx context.Context, cfg Config, initSystem string) err
 		return cfg.RunOpenRC(ctx, "rc-service", "--nodeps", guardOpenRCName, "restart")
 	}
 	return cfg.RunSystemctl(ctx, "restart", guardServiceName)
+}
+
+func stopGuardService(ctx context.Context, cfg Config, initSystem string) error {
+	if initSystem == initOpenRC {
+		return cfg.RunOpenRC(ctx, "rc-service", "--nodeps", guardOpenRCName, "stop")
+	}
+	return cfg.RunSystemctl(ctx, "stop", guardServiceName)
+}
+
+func disableGuardService(ctx context.Context, cfg Config, initSystem string) error {
+	if initSystem == initOpenRC {
+		return cfg.RunOpenRC(ctx, "rc-update", "del", guardOpenRCName, "default")
+	}
+	return cfg.RunSystemctl(ctx, "disable", guardServiceName)
 }
 
 func verifyAgentGuardHealth(ctx context.Context, socket string) error {
@@ -453,16 +653,68 @@ func downloadSignedPair(ctx context.Context, client *http.Client, bases []string
 	return fmt.Errorf("download signed Agent Guard: %w", lastErr)
 }
 
-func downloadFromBases(ctx context.Context, client *http.Client, bases []string, name, target string, limit int64) error {
+func downloadVerifiedManifestFromBases(
+	ctx context.Context,
+	client *http.Client,
+	bases []string,
+	name, target string,
+	limit int64,
+	guardBinary, agentBinary string,
+	verify func(context.Context, string, string, string) error,
+) error {
 	var lastErr error
 	for _, base := range bases {
-		if err := downloadFile(ctx, client, strings.TrimRight(base, "/")+"/"+name, target, limit); err == nil {
-			return nil
-		} else {
+		url := strings.TrimRight(base, "/") + "/" + name
+		if err := downloadFile(ctx, client, url, target, limit); err != nil {
 			lastErr = err
+			continue
 		}
+		if err := verify(ctx, guardBinary, target, agentBinary); err != nil {
+			lastErr = fmt.Errorf("verify Agent manifest from %s: %w", base, err)
+			continue
+		}
+		return nil
 	}
 	return fmt.Errorf("download %s: %w", name, lastErr)
+}
+
+func verifyAgentManifest(ctx context.Context, guardBinary, manifestPath, agentBinary string) error {
+	cmd := exec.CommandContext(ctx, guardBinary,
+		"--role", "agent", "--manifest", manifestPath,
+		"--verify-manifest-for", agentBinary)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func waitForHealthyGuard(
+	ctx context.Context,
+	socket string,
+	waitForSocket func(context.Context, string) error,
+	verifyHealth func(context.Context, string) error,
+) error {
+	if err := waitForSocket(ctx, socket); err != nil {
+		return fmt.Errorf("wait for socket: %w", err)
+	}
+	var lastErr error
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		lastErr = verifyHealth(attemptCtx, socket)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return fmt.Errorf("%w; last health error: %v", ctx.Err(), lastErr)
+		case <-timer.C:
+		}
+	}
 }
 
 func downloadFile(ctx context.Context, client *http.Client, url, path string, limit int64) error {
@@ -497,17 +749,25 @@ func downloadFile(ctx context.Context, client *http.Client, url, path string, li
 }
 
 func installAtomic(source, target string) error {
+	return installAtomicMode(source, target, 0o755)
+}
+
+func installAtomicMode(source, target string, mode os.FileMode) error {
 	data, err := os.ReadFile(source)
 	if err != nil {
 		return err
 	}
+	return writeAtomicFile(target, data, mode)
+}
+
+func writeAtomicFile(target string, data []byte, mode os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(target), ".mmwx-guardd-*")
 	if err != nil {
 		return err
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o755); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -561,6 +821,9 @@ WantedBy=multi-user.target
 	} else if err != nil {
 		return fmt.Errorf("inspect Agent Guard service: %w", err)
 	}
+	if err := migrateLegacyAgentGuardDependency(filepath.Join(cfg.SystemdDir, "mmw-agent.service")); err != nil {
+		return err
+	}
 	dropinDir := filepath.Join(cfg.SystemdDir, "mmw-agent.service.d")
 	if err := os.MkdirAll(dropinDir, 0o755); err != nil {
 		return err
@@ -574,6 +837,38 @@ Environment="MMWX_GUARD_SOCKET=%s"
 `, guardServiceName, guardServiceName, cfg.SocketPath)
 	if err := os.WriteFile(filepath.Join(dropinDir, "action-guard.conf"), []byte(dropin), 0o644); err != nil {
 		return fmt.Errorf("write Agent Guard service dependency: %w", err)
+	}
+	return nil
+}
+
+func migrateLegacyAgentGuardDependency(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read Agent systemd service: %w", err)
+	}
+	const legacy = "Requires=" + guardServiceName
+	const replacement = "Wants=" + guardServiceName
+	lines := strings.Split(string(data), "\n")
+	changed := false
+	for index, line := range lines {
+		if line != legacy {
+			continue
+		}
+		lines[index] = replacement
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("inspect Agent systemd service mode: %w", err)
+	}
+	if err := writeAtomicFile(path, []byte(strings.Join(lines, "\n")), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("migrate legacy Agent Guard systemd dependency: %w", err)
 	}
 	return nil
 }
