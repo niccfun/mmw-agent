@@ -49,6 +49,11 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.5.8 (2026-08-17)
+- 🛠️ fix: 修复 Agent Guard 引导升级与失败回滚
+- 🛠️ fix: 修复 Agent 租约确认与过期槽位自愈
+- 🛠️ fix: 激活码保存到agent
+
 ### v0.5.7 (2026-08-16)
 - 🛠️ fix: tmp文件目录重复guard占用空间
 - 🛠️ fix: 软件源上传未完成导致验签失败
