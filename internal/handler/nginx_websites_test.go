@@ -37,6 +37,43 @@ func TestClassifyNginxWebsiteResolvesProxyPassVariable(t *testing.T) {
 	}
 }
 
+func TestClassifyNginxWebsiteAllowsCleanupAfterLastWSSNode(t *testing.T) {
+	info := fakeWebsiteInfo{}
+	active := classifyNginxWebsite("/tmp/wss.example.com.conf", info, `# MMWX-WSS v1
+server {
+    server_name wss.example.com;
+    location = /ws/random {
+        if ($http_upgrade != "websocket") { return 404; }
+        proxy_pass http://127.0.0.1:11000;
+    }
+    location / { return 404; }
+}`)
+	if !active.Managed || !active.Protected || active.Reason != "配置仍承载 WSS 节点，请先删除对应节点" {
+		t.Fatalf("active WSS config must remain protected: %+v", active)
+	}
+
+	empty := classifyNginxWebsite("/tmp/wss.example.com.conf", info, `# MMWX-WSS v1
+server {
+    server_name wss.example.com;
+    location / { return 404; }
+}`)
+	if !empty.Managed || empty.Protected {
+		t.Fatalf("empty generated WSS config should be removable: %+v", empty)
+	}
+}
+
+func TestClassifyNginxWebsiteRecognizesLegacyGeneratedWSS(t *testing.T) {
+	info := fakeWebsiteInfo{}
+	legacy := classifyNginxWebsite("/tmp/wss.example.com.conf", info, `# 自动生成,妙妙屋X WSS 入站 nginx 反代配置。多个 WSS 入站合并渲染。
+server {
+    server_name wss.example.com;
+    location / { return 404; }
+}`)
+	if !legacy.Managed || legacy.Protected {
+		t.Fatalf("legacy empty WSS config should be removable: %+v", legacy)
+	}
+}
+
 type fakeWebsiteInfo struct{}
 
 func (fakeWebsiteInfo) Name() string       { return "site.conf" }
