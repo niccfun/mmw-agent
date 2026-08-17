@@ -241,14 +241,7 @@ func (c *Client) secureRoundTripLocked(ctx context.Context, method, path string,
 	}
 	session.receivedSequence = responseEnvelope.Sequence
 	if resp.StatusCode != http.StatusOK {
-		var result struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(decrypted, &result)
-		if result.Error == "" {
-			result.Error = strings.TrimSpace(string(decrypted))
-		}
-		return errors.New(result.Error)
+		return parseRequestError(resp.StatusCode, resp.Header.Get("Retry-After"), decrypted, time.Now())
 	}
 	if response != nil && json.Unmarshal(decrypted, response) != nil {
 		return errors.New("Action Guard 返回无效响应")

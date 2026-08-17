@@ -45,6 +45,8 @@ sign-local.sh.example
 sign-local.sh
 *_test.go
 !internal/guardclient/client_test.go
+!internal/guardclient/errors_test.go
+!internal/agent/lease_capabilities_test.go
 !internal/guardbootstrap/bootstrap_test.go
 !internal/licenselease/manager_test.go
 !internal/handler/nginx_websites_test.go

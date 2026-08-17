@@ -17,6 +17,10 @@ type Delivery struct {
 	Reservation      string `json:"reservation"`
 	LicenseServerURL string `json:"license_server_url"`
 	ExpiresAt        int64  `json:"reservation_expires_at"`
+	// RequestID is an opaque master correlation value. It is not authority and
+	// is deliberately outside the signed reservation; the Agent only echoes it
+	// after Guard activation so stale delivery ACKs cannot complete a newer job.
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type Manager struct {
@@ -71,7 +75,7 @@ func (m *Manager) UpdateServerToken(token string) error {
 	if err := m.guard.ReleaseSlot(ctx); err != nil {
 		return errors.New("release stale authoritative slot: " + err.Error())
 	}
-	m.applyStatus(guardclient.SlotStatus{})
+	m.applyStatus(guardclient.SlotStatus{Capabilities: status.Capabilities})
 	_ = os.Remove(m.statePath)
 	return nil
 }
@@ -80,6 +84,15 @@ func (m *Manager) Status() guardclient.SlotStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.status
+}
+
+// LeaseIdentityCapable reports the capability explicitly advertised by the
+// running Guard. Older Guards omit it, so a new Agent must not promise the
+// master an identity value that its Guard cannot supply.
+func (m *Manager) LeaseIdentityCapable() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status.Capabilities.LeaseIdentity
 }
 
 func (m *Manager) ServerHash() string {
@@ -178,6 +191,16 @@ func (m *Manager) refreshIfNeeded(ctx context.Context) {
 	defer cancel()
 	status, err := m.guard.RefreshSlot(refreshCtx)
 	if err != nil {
+		code, _, _ := guardclient.ErrorMetadata(err)
+		if leaseRejectionNeedsReplacement(code) {
+			// The service has advanced or invalidated this signed slot. Grace
+			// cannot repair its serial/authority, so advertise needsLease now and
+			// let the master's guarded replacement path obtain a fresh reservation.
+			capabilities := m.Status().Capabilities
+			m.applyStatus(guardclient.SlotStatus{Capabilities: capabilities})
+			m.notifyIfChanged()
+			return
+		}
 		// Re-read Guard state so an exhausted grace period transitions back to
 		// NeedsLease. Otherwise a cached renewable=true could suppress new
 		// reservations forever after a prolonged outage.
@@ -193,11 +216,21 @@ func (m *Manager) refreshIfNeeded(ctx context.Context) {
 	m.applyStatus(status)
 }
 
+func leaseRejectionNeedsReplacement(code string) bool {
+	switch code {
+	case "server_slot_stale_generation", "server_slot_state_conflict", "server_slot_not_active", "stale_license_authority":
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Manager) Release(ctx context.Context) error {
+	capabilities := m.Status().Capabilities
 	if err := m.guard.ReleaseSlot(ctx); err != nil {
 		return err
 	}
-	m.applyStatus(guardclient.SlotStatus{})
+	m.applyStatus(guardclient.SlotStatus{Capabilities: capabilities})
 	_ = os.Remove(m.statePath)
 	return nil
 }

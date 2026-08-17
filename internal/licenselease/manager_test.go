@@ -19,6 +19,7 @@ type fakeGuard struct {
 	refreshed   int
 	released    int
 	refreshFail bool
+	refreshErr  error
 }
 
 func (f *fakeGuard) Enabled() bool { return true }
@@ -47,12 +48,63 @@ func (f *fakeGuard) RefreshSlot(context.Context) (guardclient.SlotStatus, error)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.refreshed++
+	if f.refreshErr != nil {
+		return guardclient.SlotStatus{}, f.refreshErr
+	}
 	if f.refreshFail {
 		f.status = guardclient.SlotStatus{}
 		return guardclient.SlotStatus{}, errors.New("license unavailable")
 	}
 	f.status.ExpiresAt = time.Now().Add(time.Hour).Unix()
 	return f.status, nil
+}
+
+func TestManagerRequestsReplacementOnStaleRefreshGeneration(t *testing.T) {
+	fake := &fakeGuard{
+		status: guardclient.SlotStatus{
+			Authorized: true, Renewable: true, ServerHash: hashServerToken("token"),
+			LicenseKeyHash: "license-identity", SlotID: 1, Generation: 1,
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+			Capabilities: guardclient.SlotCapabilities{LeaseIdentity: true},
+		},
+		refreshErr: &guardclient.RequestError{
+			Message: "stale server slot generation", Code: "server_slot_stale_generation",
+			StatusCode: 409, UpstreamStatus: 409,
+		},
+	}
+	manager, err := New("", filepath.Join(t.TempDir(), "state"), "token", fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.nextRefresh = time.Now().Add(-time.Second)
+	manager.mu.Unlock()
+	manager.refreshIfNeeded(t.Context())
+
+	if !manager.NeedsLease() || manager.Authorized() {
+		t.Fatal("stale refresh generation remained renewable instead of requesting replacement")
+	}
+	if !manager.LeaseIdentityCapable() {
+		t.Fatal("replacement transition lost the running Guard capability")
+	}
+}
+
+func TestLeaseRejectionReplacementClassification(t *testing.T) {
+	for _, code := range []string{
+		"server_slot_stale_generation",
+		"server_slot_state_conflict",
+		"server_slot_not_active",
+		"stale_license_authority",
+	} {
+		if !leaseRejectionNeedsReplacement(code) {
+			t.Fatalf("refresh rejection %q did not request a replacement", code)
+		}
+	}
+	for _, code := range []string{"", "rate_limited", "server_slot_refresh_failed"} {
+		if leaseRejectionNeedsReplacement(code) {
+			t.Fatalf("transient refresh rejection %q discarded the renewable slot", code)
+		}
+	}
 }
 
 func (f *fakeGuard) ReleaseSlot(context.Context) error {
@@ -133,6 +185,27 @@ func TestManagerReleasesSlotSignedForPreviousTokenOnStartup(t *testing.T) {
 	}
 	if !manager.NeedsLease() || manager.Authorized() {
 		t.Fatal("manager did not request a replacement lease after stale slot release")
+	}
+}
+
+func TestManagerPreservesLeaseIdentityCapabilityWhileAwaitingReplacement(t *testing.T) {
+	fake := &fakeGuard{status: guardclient.SlotStatus{
+		Authorized: true, Renewable: true, ServerHash: hashServerToken("old-token"),
+		LicenseKeyHash: "old-license", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		Capabilities: guardclient.SlotCapabilities{LeaseIdentity: true},
+	}}
+	manager, err := New("", filepath.Join(t.TempDir(), "state"), "old-token", fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.UpdateServerToken("new-token"); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.LeaseIdentityCapable() {
+		t.Fatal("Guard capability was lost while the released slot awaited replacement")
+	}
+	if got := manager.Status().LicenseKeyHash; got != "" {
+		t.Fatalf("released slot identity remained active: %q", got)
 	}
 }
 

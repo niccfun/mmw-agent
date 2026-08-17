@@ -38,6 +38,36 @@ func TestActionGuardCannotBeDisabledByEnvironment(t *testing.T) {
 	}
 }
 
+func TestSlotStatusLeaseIdentityCapabilityIsRollingUpgradeSafe(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{
+			name: "legacy Guard test.3 without capability",
+			raw:  `{"authorized":true,"server_hash":"legacy"}`,
+			want: false,
+		},
+		{
+			name: "new Guard capability while unleased",
+			raw:  `{"authorized":false,"capabilities":{"lease_identity":true}}`,
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var status SlotStatus
+			if err := json.Unmarshal([]byte(tt.raw), &status); err != nil {
+				t.Fatal(err)
+			}
+			if got := status.Capabilities.LeaseIdentity; got != tt.want {
+				t.Fatalf("lease identity capability = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHealthUsesAuthenticatedEncryptedSession(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "guard.sock")
 	listener, err := net.Listen("unix", socket)
