@@ -31,6 +31,7 @@ func nginxRun(name string, args ...string) error {
 type nginxRuntime struct {
 	Installed  bool   `json:"installed"`
 	Running    bool   `json:"running"`
+	Version    string `json:"version,omitempty"`
 	Binary     string `json:"binary,omitempty"`
 	ConfigPath string `json:"config_path,omitempty"`
 	ConfigDir  string `json:"config_dir,omitempty"`
@@ -39,6 +40,15 @@ type nginxRuntime struct {
 	CanManage  bool   `json:"can_manage"`
 	ManagedDir string `json:"managed_dir,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+}
+
+var nginxVersionPattern = regexp.MustCompile(`nginx version:\s*nginx/([^\s]+)`)
+
+func parseNginxVersionOutput(output string) string {
+	if match := nginxVersionPattern.FindStringSubmatch(output); len(match) == 2 {
+		return strings.TrimSpace(match[1])
+	}
+	return ""
 }
 
 func findNginxBinary() string {
@@ -53,20 +63,34 @@ func findNginxBinary() string {
 func commandExists(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
 func detectNginxManager() string {
+	initScript := fileExecutable("/etc/init.d/nginx")
 	switch {
-	case commandExists("systemctl") && isSystemdRunning():
+	case commandExists("systemctl") && isSystemdRunning() && systemdNginxUnitExists():
 		return "systemd"
-	case commandExists("rc-service"):
+	case commandExists("rc-service") && initScript:
 		return "openrc"
-	case commandExists("service"):
+	case commandExists("service") && initScript:
 		return "sysv"
-	case fileExecutable("/etc/init.d/nginx"):
+	case initScript:
 		return "initd"
 	case commandExists("supervisorctl"):
-		return "supervisor"
+		out, err := nginxCombinedOutput("supervisorctl", "status", "nginx")
+		if err == nil && !strings.Contains(strings.ToLower(string(out)), "no such process") {
+			return "supervisor"
+		}
+		fallthrough
 	default:
 		return "command"
 	}
+}
+
+func systemdNginxUnitExists() bool {
+	out, err := nginxCombinedOutput("systemctl", "show", "nginx.service", "--property=LoadState", "--value")
+	if err != nil {
+		return false
+	}
+	state := strings.TrimSpace(string(out))
+	return state != "" && state != "not-found"
 }
 
 func isSystemdRunning() bool {
@@ -79,14 +103,145 @@ func fileExecutable(path string) bool {
 	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
 }
 
+func nginxIncludedServerDir(configPath, config string) string {
+	includeRE := regexp.MustCompile(`(?m)^[\t ]*include[\t ]+([^;#]+);`)
+	for _, match := range includeRE.FindAllStringSubmatch(config, -1) {
+		pattern := strings.Trim(strings.TrimSpace(match[1]), `"'`)
+		if strings.Contains(pattern, "$") {
+			continue
+		}
+		clean := filepath.Clean(pattern)
+		base := filepath.Base(filepath.Dir(clean))
+		if base != "servers" && base != "conf.d" && base != "sites-enabled" {
+			continue
+		}
+		dir := filepath.Dir(clean)
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(filepath.Dir(configPath), dir)
+		}
+		return filepath.Clean(dir)
+	}
+	return ""
+}
+
+func nginxHTTPBlockEnd(config string) (int, bool) {
+	match := regexp.MustCompile(`(?m)^[\t ]*http[\t ]*\{`).FindStringIndex(config)
+	if match == nil {
+		return 0, false
+	}
+	open := strings.Index(config[match[0]:match[1]], "{") + match[0]
+	depth := 0
+	var quote byte
+	escaped, comment := false, false
+	for i := open; i < len(config); i++ {
+		c := config[i]
+		if comment {
+			if c == '\n' {
+				comment = false
+			}
+			continue
+		}
+		if quote != 0 {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '#':
+			comment = true
+		case '"', '\'':
+			quote = c
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func addNginxManagedInclude(config string) (string, error) {
+	end, ok := nginxHTTPBlockEnd(config)
+	if !ok {
+		return "", fmt.Errorf("nginx 主配置缺少 http 块")
+	}
+	prefix := config[:end]
+	if !strings.HasSuffix(prefix, "\n") {
+		prefix += "\n"
+	}
+	return prefix + "    include servers/*.conf;\n" + config[end:], nil
+}
+
+func ensureNginxManagedConfig() error {
+	rt := inspectNginxRuntime()
+	if !rt.Installed {
+		return fmt.Errorf("nginx not installed")
+	}
+	if rt.CanManage {
+		return nil
+	}
+	if filepath.Clean(rt.Binary) != filepath.Join(constants.NginxPrimaryPrefixDir, "sbin", "nginx") {
+		return fmt.Errorf("现有 Nginx 配置未包含可管理目录，拒绝自动修改外部安装: %s", rt.ConfigPath)
+	}
+	if rt.ConfigPath == "" {
+		return fmt.Errorf("无法确定 nginx 主配置路径")
+	}
+	original, err := os.ReadFile(rt.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("读取 nginx 主配置: %w", err)
+	}
+	updated, err := addNginxManagedInclude(string(original))
+	if err != nil {
+		return err
+	}
+	managedDir := filepath.Join(filepath.Dir(rt.ConfigPath), "servers")
+	if err := os.MkdirAll(managedDir, 0755); err != nil {
+		return fmt.Errorf("创建 nginx servers 目录: %w", err)
+	}
+	mode := os.FileMode(0644)
+	if info, statErr := os.Stat(rt.ConfigPath); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := os.WriteFile(rt.ConfigPath, []byte(updated), mode); err != nil {
+		return fmt.Errorf("更新 nginx 主配置: %w", err)
+	}
+	if err := nginxTest(); err != nil {
+		_ = os.WriteFile(rt.ConfigPath, original, mode)
+		return fmt.Errorf("自动加入 servers/*.conf 后配置校验失败，已回滚: %w", err)
+	}
+	if rt.Running {
+		if err := nginxReload(); err != nil {
+			_ = os.WriteFile(rt.ConfigPath, original, mode)
+			_ = nginxReload()
+			return fmt.Errorf("重载 nginx 失败，已回滚: %w", err)
+		}
+	}
+	return nil
+}
+
 func inspectNginxRuntime() nginxRuntime {
 	bin := findNginxBinary()
-	rt := nginxRuntime{Installed: bin != "", Binary: bin, Manager: detectNginxManager()}
+	rt := nginxRuntime{Binary: bin, Manager: "none"}
 	if bin == "" {
 		return rt
 	}
-	out, _ := nginxCombinedOutput(bin, "-V")
+	out, err := nginxCombinedOutput(bin, "-V")
+	if err != nil {
+		rt.Reason = fmt.Sprintf("检测到残留 Nginx 文件但无法执行: %s", bin)
+		return rt
+	}
+	rt.Installed = true
+	rt.Manager = detectNginxManager()
 	flags := string(out)
+	rt.Version = parseNginxVersionOutput(flags)
 	value := func(name string) string {
 		re := regexp.MustCompile(`--` + regexp.QuoteMeta(name) + `=([^\s]+)`)
 		if match := re.FindStringSubmatch(flags); len(match) == 2 {
@@ -106,13 +261,7 @@ func inspectNginxRuntime() nginxRuntime {
 	if rt.ConfigPath != "" {
 		rt.ConfigDir = filepath.Dir(rt.ConfigPath)
 		if data, err := os.ReadFile(rt.ConfigPath); err == nil {
-			conf := string(data)
-			switch {
-			case strings.Contains(conf, "servers/*.conf") || strings.Contains(conf, "servers/*"):
-				rt.ManagedDir = filepath.Join(rt.ConfigDir, "servers")
-			case strings.Contains(conf, "conf.d/*.conf") || strings.Contains(conf, "conf.d/*"):
-				rt.ManagedDir = filepath.Join(rt.ConfigDir, "conf.d")
-			}
+			rt.ManagedDir = nginxIncludedServerDir(rt.ConfigPath, string(data))
 			rt.CanManage = rt.ManagedDir != ""
 			if !rt.CanManage {
 				rt.Reason = "nginx 主配置未 include servers/*.conf"
@@ -121,6 +270,18 @@ func inspectNginxRuntime() nginxRuntime {
 	}
 	rt.PIDPath = value("pid-path")
 	rt.Running = nginxIsActive()
+	return finalizeNginxRuntime(rt, isSystemdRunning())
+}
+
+func finalizeNginxRuntime(rt nginxRuntime, systemdHost bool) nginxRuntime {
+	// MMWX 在 systemd 主机上的完整安装一定带 nginx.service。用户手动删除 unit
+	// 和进程后，即使遗留 /usr/local/nginx/sbin/nginx，也不能继续显示为“已安装”。
+	if rt.Installed && systemdHost && rt.Manager == "command" && !rt.Running {
+		rt.Installed = false
+		rt.CanManage = false
+		rt.ManagedDir = ""
+		rt.Reason = fmt.Sprintf("Nginx 服务和进程均不存在，仅检测到残留文件: %s", rt.Binary)
+	}
 	return rt
 }
 

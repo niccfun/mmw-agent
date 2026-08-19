@@ -49,6 +49,17 @@ curl -sL https://raw.githubusercontent.com/nuxproio/mmw-agent/main/install.sh | 
 <details>
 <summary>更新日志</summary>
 
+### v0.5.9 (2026-08-17)
+- 🛠️ fix: 支持清理空闲 WSS Nginx 配置
+- 🛠️ fix: nginx配置兜底
+- 🛠️ fix: 级联删除入站
+- 🛠️ fix: agent卸载失败
+- 🔒 保持本地永久许可证授权逻辑及 `nuxproio/mmw-agent` 更新源
+
+### v0.5.0-v0.5.8 (上游版本)
+- 上游期间的 Guard、租约和许可证链路未合入本分支
+- 与许可证无关的兼容性修复已筛选合并至 v0.5.9
+
 ### v0.4.9 (2026-08-10)
 - 🌈 rc-service启动失败
 - 🌈 ws连接不稳定的适合反复重启

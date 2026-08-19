@@ -37,17 +37,31 @@ jobs:
           mkdir -p dist
           # publish-cdn 与 build.yml 都由 release:published 触发,本步可能抢在 build.yml 上传二进制
           # 之前跑 → "no assets to download" 直接失败(R2 一片空)。这里重试等待资产出现(最多 ~10min)。
+          required_assets=(
+            mmw-agent-linux-amd64 mmw-agent-linux-amd64.sig
+            mmw-agent-linux-arm64 mmw-agent-linux-arm64.sig
+            mmw-agent-darwin-amd64 mmw-agent-darwin-amd64.sig
+            mmw-agent-darwin-arm64 mmw-agent-darwin-arm64.sig
+          )
+          complete=0
           for i in $(seq 1 40); do
-            if gh release download "$TAG" --repo "${{ github.repository }}" --pattern 'mmw-agent-*' --dir dist 2>/dev/null; then
-              echo "第 $i 次尝试:资产已下载"
+            rm -f dist/mmw-agent-*
+            gh release download "$TAG" --repo "${{ github.repository }}" --pattern 'mmw-agent-*' --dir dist 2>/dev/null || true
+            missing=()
+            for name in "${required_assets[@]}"; do
+              [ -s "dist/$name" ] || missing+=("$name")
+            done
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "第 $i 次尝试:全部 ${#required_assets[@]} 个资产已下载"
+              complete=1
               break
             fi
-            echo "第 $i 次尝试:资产还没就绪,等 15s 再试..."
+            echo "第 $i 次尝试:仍缺少 ${missing[*]},等 15s 再试..."
             sleep 15
           done
           ls -la dist
-          if ! ls dist/mmw-agent-* >/dev/null 2>&1; then
-            echo "::error::等待超时:release $TAG 仍无 mmw-agent-* 资产(build.yml 可能失败或资产命名变了)"
+          if [ "$complete" != "1" ]; then
+            echo "::error::等待超时:release $TAG 的 Agent 二进制或签名不完整"
             exit 1
           fi
 
@@ -84,7 +98,11 @@ jobs:
             aws s3 cp "$f" "s3://$BUCKET/$PROJECT/$name" \
               --endpoint-url "$R2_ENDPOINT" \
               --content-type application/octet-stream \
-              --cache-control "public, max-age=86400"
+              --cache-control "public, max-age=60, must-revalidate"
+            aws s3 cp "$f" "s3://$BUCKET/$PROJECT/releases/$TAG/$name" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --content-type application/octet-stream \
+              --cache-control "public, max-age=31536000, immutable"
           done
           aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/version.json" \
             --endpoint-url "$R2_ENDPOINT" \

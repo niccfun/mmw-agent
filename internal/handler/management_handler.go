@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2519,7 +2520,7 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 从配置文件移除（主流程）
-		configErr := h.removeInboundFromConfig(req.Tag)
+		routingChanged, configErr := h.removeInboundFromConfig(req.Tag)
 		if configErr != nil {
 			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
 		}
@@ -2543,10 +2544,17 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 配置成功时，运行态报错可接受（可能尚未加载）
+		// 路由引用只能通过重载生效；运行态删除异常时也通过重载清理残留。
+		if routingChanged || (runtimeErr != nil && !strings.Contains(runtimeErr.Error(), "not enough information")) {
+			if restartErr := h.RestartXray(); restartErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("入站配置已删除，但 Xray 重载失败: %v", restartErr))
+				return
+			}
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
-			"message": "Inbound removed successfully",
+			"message": "入站及关联路由已删除",
 		})
 
 	default:
@@ -2613,7 +2621,7 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 			log.Printf("[Manage] Warning: Failed to remove inbound from runtime: %v", runtimeErr)
 		}
 
-		configErr := h.removeInboundFromConfig(req.Tag)
+		routingChanged, configErr := h.removeInboundFromConfig(req.Tag)
 		if configErr != nil {
 			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
 		}
@@ -2627,9 +2635,16 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 			return
 		}
 
+		if routingChanged || runtimeErr != nil {
+			if restartErr := h.RestartXray(); restartErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("入站配置已删除，但 Xray 重载失败: %v", restartErr))
+				return
+			}
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
-			"message": "Inbound removed successfully",
+			"message": "入站及关联路由已删除",
 		})
 
 	default:
@@ -4060,20 +4075,173 @@ func (h *ManageHandler) persistInbound(inbound map[string]interface{}) error {
 	return os.WriteFile(configPath, newContent, 0644)
 }
 
-func (h *ManageHandler) removeInboundFromConfig(tag string) error {
+func inboundMatchesRemovalTag(inbound map[string]interface{}, tag string) bool {
+	if inboundTag, _ := inbound["tag"].(string); inboundTag != "" {
+		return inboundTag == tag
+	}
+	protocol, _ := inbound["protocol"].(string)
+	port := 0
+	switch value := inbound["port"].(type) {
+	case float64:
+		port = int(value)
+	case int:
+		port = value
+	}
+	return protocol != "" && port > 0 && tag == fmt.Sprintf("%s-%d", protocol, port)
+}
+
+// removeInboundRoutingReferences removes or narrows rules that reference a
+// deleted inbound. Rules that also reference other inbounds are preserved.
+func removeInboundRoutingReferences(config map[string]interface{}, tag string) int {
+	routing, _ := config["routing"].(map[string]interface{})
+	if routing == nil {
+		return 0
+	}
+	rules, ok := routing["rules"].([]interface{})
+	if !ok {
+		return 0
+	}
+	changed := 0
+	kept := make([]interface{}, 0, len(rules))
+	for _, rawRule := range rules {
+		rule, ok := rawRule.(map[string]interface{})
+		if !ok {
+			kept = append(kept, rawRule)
+			continue
+		}
+		rawTags, exists := rule["inboundTag"]
+		if !exists {
+			kept = append(kept, rawRule)
+			continue
+		}
+		switch tags := rawTags.(type) {
+		case []interface{}:
+			remaining := make([]interface{}, 0, len(tags))
+			for _, rawTag := range tags {
+				if value, ok := rawTag.(string); ok && value == tag {
+					changed++
+					continue
+				}
+				remaining = append(remaining, rawTag)
+			}
+			if len(remaining) == 0 && len(tags) > 0 {
+				continue
+			}
+			if len(remaining) != len(tags) {
+				rule["inboundTag"] = remaining
+			}
+		case []string:
+			remaining := make([]string, 0, len(tags))
+			for _, value := range tags {
+				if value == tag {
+					changed++
+					continue
+				}
+				remaining = append(remaining, value)
+			}
+			if len(remaining) == 0 && len(tags) > 0 {
+				continue
+			}
+			if len(remaining) != len(tags) {
+				rule["inboundTag"] = remaining
+			}
+		case string:
+			if tags == tag {
+				changed++
+				continue
+			}
+		}
+		kept = append(kept, rawRule)
+	}
+	if changed > 0 {
+		routing["rules"] = kept
+	}
+	return changed
+}
+
+// removeInboundFromConfDir also cleans legacy split Xray configurations.
+func removeInboundFromConfDir(confDir, mainPath, tag string) (bool, error) {
+	if strings.TrimSpace(confDir) == "" {
+		return false, nil
+	}
+	entries, err := os.ReadDir(confDir)
+	if err != nil {
+		return false, fmt.Errorf("read xray confdir: %w", err)
+	}
+	routingChanged := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			continue
+		}
+		path := filepath.Join(confDir, entry.Name())
+		if filepath.Clean(path) == filepath.Clean(mainPath) {
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return routingChanged, fmt.Errorf("read xray config fragment %s: %w", path, err)
+		}
+		var config map[string]interface{}
+		if err := json.Unmarshal(content, &config); err != nil {
+			return routingChanged, fmt.Errorf("parse xray config fragment %s: %w", path, err)
+		}
+
+		if _, singleInbound := config["protocol"].(string); singleInbound {
+			if inboundMatchesRemovalTag(config, tag) {
+				if err := os.Remove(path); err != nil {
+					return routingChanged, fmt.Errorf("remove xray inbound fragment %s: %w", path, err)
+				}
+			}
+			continue
+		}
+
+		changed := false
+		if inbounds, ok := config["inbounds"].([]interface{}); ok {
+			kept := make([]interface{}, 0, len(inbounds))
+			for _, rawInbound := range inbounds {
+				inbound, ok := rawInbound.(map[string]interface{})
+				if ok && inboundMatchesRemovalTag(inbound, tag) {
+					changed = true
+					continue
+				}
+				kept = append(kept, rawInbound)
+			}
+			if changed {
+				config["inbounds"] = kept
+			}
+		}
+		if removeInboundRoutingReferences(config, tag) > 0 {
+			routingChanged = true
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		updated, err := json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return routingChanged, fmt.Errorf("marshal xray config fragment %s: %w", path, err)
+		}
+		if err := os.WriteFile(path, updated, 0644); err != nil {
+			return routingChanged, fmt.Errorf("write xray config fragment %s: %w", path, err)
+		}
+	}
+	return routingChanged, nil
+}
+
+func (h *ManageHandler) removeInboundFromConfig(tag string) (bool, error) {
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
-		return fmt.Errorf("config file not found")
+		return false, fmt.Errorf("config file not found")
 	}
 
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("failed to read config: %w", err)
+		return false, fmt.Errorf("failed to read config: %w", err)
 	}
 
 	var config map[string]interface{}
 	if err := json.Unmarshal(content, &config); err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
+		return false, fmt.Errorf("failed to parse config: %w", err)
 	}
 
 	inbounds, _ := config["inbounds"].([]interface{})
@@ -4084,35 +4252,28 @@ func (h *ManageHandler) removeInboundFromConfig(tag string) error {
 			newInbounds = append(newInbounds, ib)
 			continue
 		}
-		ibTag, _ := inbound["tag"].(string)
-		if ibTag == tag {
-			continue // 精确匹配 → 删
-		}
-		// listInbounds 会给 tag 缺失的 inbound 虚拟一个 `<protocol>-<port>` tag 让前端能引用,
-		// remove 时也要识别这种虚拟 tag,否则原 inbound 永远删不掉 → mmwx 再 add 一份 → 同端口两份 inbound → xray 启动失败
-		if ibTag == "" {
-			proto, _ := inbound["protocol"].(string)
-			port := 0
-			switch p := inbound["port"].(type) {
-			case float64:
-				port = int(p)
-			case int:
-				port = p
-			}
-			if proto != "" && port > 0 && tag == fmt.Sprintf("%s-%d", proto, port) {
-				continue
-			}
+		if inboundMatchesRemovalTag(inbound, tag) {
+			continue
 		}
 		newInbounds = append(newInbounds, ib)
 	}
 	config["inbounds"] = newInbounds
+	routingChanged := removeInboundRoutingReferences(config, tag) > 0
 
 	newContent, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return false, fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	return os.WriteFile(configPath, newContent, 0644)
+	if err := os.WriteFile(configPath, newContent, 0644); err != nil {
+		return false, err
+	}
+	paths := h.findXrayConfigInfo()
+	confDirRoutingChanged, err := removeInboundFromConfDir(paths.ConfDir, configPath, tag)
+	if err != nil {
+		return routingChanged, err
+	}
+	return routingChanged || confDirRoutingChanged, nil
 }
 
 func (h *ManageHandler) persistOutbound(outbound map[string]interface{}) error {
@@ -5603,20 +5764,99 @@ func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *htt
 		return
 	}
 	log.Printf("[Manage] Starting Agent uninstall (stream)...")
-	script := `
+	cmd := exec.CommandContext(r.Context(), "bash", "-c", agentUninstallScheduleScript)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Agent uninstall scheduled")
+}
+
+// agentUninstallScheduleScript runs outside the agent service's cgroup so the
+// cleanup can finish after the running agent is stopped.
+const agentUninstallScheduleScript = `
 set -e
 echo "=========================================="
 echo "  MMW-Agent Uninstall"
 echo "=========================================="
 
-echo "Scheduling delayed uninstall..."
-nohup bash -c 'sleep 2 && systemctl stop mmw-agent && systemctl disable mmw-agent && rm -f /usr/local/bin/mmw-agent && rm -f /etc/systemd/system/mmw-agent.service && systemctl daemon-reload && rm -rf /etc/mmw-agent /var/lib/mmw-agent && echo "Agent uninstalled"' >/dev/null 2>&1 &
-echo "Agent will be uninstalled in a few seconds."
+HELPER="/tmp/mmw-agent-uninstall-$$.sh"
+cat > "$HELPER" <<'MMWX_UNINSTALL'
+#!/bin/sh
+set +e
+sleep 2
+LOG=/tmp/mmw-agent-uninstall.log
+exec >>"$LOG" 2>&1
+echo "$(date -Iseconds 2>/dev/null || date) uninstall started"
+
+SERVICES="mmw-agent agent-mmwx mmwx-agent"
+
+# Remove boot and respawn entry points before stopping any running service.
+if command -v systemctl >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        systemctl disable "$service.service" >/dev/null 2>&1 || true
+    done
+fi
+if command -v rc-update >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        rc-update del "$service" default >/dev/null 2>&1 || rc-update del "$service" >/dev/null 2>&1 || true
+    done
+fi
+if [ -f /etc/rc.local ]; then
+    sed -i '/mmw-agent-supervisor\.sh/d;/\/usr\/local\/bin\/mmw-agent[[:space:]]/d;/\/usr\/local\/bin\/agent-mmwx[[:space:]]/d;/\/usr\/local\/bin\/mmwx-agent[[:space:]]/d' /etc/rc.local 2>/dev/null || true
+fi
+
+rm -f /usr/local/bin/mmw-agent /usr/local/bin/agent-mmwx /usr/local/bin/mmwx-agent
+rm -f /usr/local/bin/mmw-agent-supervisor.sh
+
+if command -v systemctl >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        systemctl stop "$service.service" >/dev/null 2>&1 || true
+    done
+fi
+if command -v rc-service >/dev/null 2>&1; then
+    for service in $SERVICES; do
+        rc-service "$service" stop >/dev/null 2>&1 || true
+    done
+fi
+
+pkill -TERM -f '/usr/local/bin/mmw-agent-supervisor\.sh' >/dev/null 2>&1 || true
+pkill -TERM -x mmw-agent >/dev/null 2>&1 || true
+pkill -TERM -x agent-mmwx >/dev/null 2>&1 || true
+pkill -TERM -x mmwx-agent >/dev/null 2>&1 || true
+sleep 2
+pkill -KILL -x mmw-agent >/dev/null 2>&1 || true
+pkill -KILL -x agent-mmwx >/dev/null 2>&1 || true
+pkill -KILL -x mmwx-agent >/dev/null 2>&1 || true
+
+rm -f /etc/systemd/system/mmw-agent.service /etc/systemd/system/agent-mmwx.service /etc/systemd/system/mmwx-agent.service
+rm -f /usr/lib/systemd/system/mmw-agent.service /usr/lib/systemd/system/agent-mmwx.service /usr/lib/systemd/system/mmwx-agent.service
+rm -f /etc/init.d/mmw-agent /etc/init.d/agent-mmwx /etc/init.d/mmwx-agent
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed mmw-agent.service agent-mmwx.service mmwx-agent.service >/dev/null 2>&1 || true
+fi
+
+rm -rf /etc/mmw-agent /var/lib/mmw-agent /etc/agent-mmwx /var/lib/agent-mmwx
+echo "$(date -Iseconds 2>/dev/null || date) Agent uninstalled"
+rm -f "$0"
+MMWX_UNINSTALL
+chmod 700 "$HELPER"
+
+echo "Scheduling detached uninstall..."
+if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    if systemd-run --quiet --no-block --collect \
+        --unit="mmw-agent-uninstall-$$" \
+        --property=Type=oneshot /bin/sh "$HELPER"; then
+        echo "Detached uninstall unit created."
+        exit 0
+    fi
+    echo "systemd-run unavailable on this system; falling back to setsid."
+fi
+if command -v setsid >/dev/null 2>&1; then
+    nohup setsid /bin/sh "$HELPER" >/dev/null 2>&1 </dev/null &
+else
+    nohup /bin/sh "$HELPER" >/dev/null 2>&1 </dev/null &
+fi
+echo "Agent uninstall accepted; cleanup will start in 2 seconds."
 `
-	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
-	cmd.Env = os.Environ()
-	sseStreamCmd(w, r, cmd, "Agent uninstall scheduled")
-}
 
 // HandleLimiter 处理 POST /api/child/limiter，用于直接配置嵌入式 Xray 的限速。
 func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
@@ -5803,26 +6043,17 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	lines := strings.Split(string(data), "\n")
-	out := make([]string, 0, len(lines)+1)
-	found := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "listen_port:") {
-			if req.ListenPort > 0 {
-				out = append(out, fmt.Sprintf("listen_port: \"%d\"", req.ListenPort))
-				found = true
-			}
-			// req.ListenPort == 0 时直接丢弃这一行(恢复默认)
-			continue
-		}
-		out = append(out, line)
-	}
-	if !found && req.ListenPort > 0 {
-		out = append(out, fmt.Sprintf("listen_port: \"%d\"", req.ListenPort))
+	newData, changed := updateListenPortYAML(data, req.ListenPort)
+	if !changed {
+		log.Printf("[Manage] Config already has effective listen_port=%d; skipping restart", req.ListenPort)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Listen port is already effective",
+		})
+		return
 	}
 
-	if err := os.WriteFile(h.configPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
+	if err := atomicWriteConfig(h.configPath, newData); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
 		return
 	}
@@ -5843,6 +6074,80 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 		log.Printf("[Manage] Exiting for listen_port switch to %d (systemd will restart)", req.ListenPort)
 		os.Exit(0)
 	}()
+}
+
+// updateListenPortYAML updates only listen_port and preserves every other line
+// verbatim. A requested port of 0 restores the built-in default.
+func updateListenPortYAML(data []byte, requested int) ([]byte, bool) {
+	lines := strings.Split(string(data), "\n")
+	out := make([]string, 0, len(lines)+1)
+	found := false
+	changed := false
+	value := strconv.Itoa(requested)
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "listen_port:") {
+			out = append(out, line)
+			continue
+		}
+
+		found = true
+		if requested == 0 {
+			changed = true
+			continue
+		}
+		current := strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "listen_port:")), "\"'")
+		if current == value {
+			out = append(out, line)
+		} else {
+			out = append(out, fmt.Sprintf("listen_port: \"%d\"", requested))
+			changed = true
+		}
+	}
+	if !found && requested > 0 {
+		out = append(out, fmt.Sprintf("listen_port: \"%d\"", requested))
+		changed = true
+	}
+	return []byte(strings.Join(out, "\n")), changed
+}
+
+// atomicWriteConfig prevents a restarting agent from observing a partially
+// written config file.
+func atomicWriteConfig(path string, data []byte) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config.yaml-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 // HandleProbeMasterURL handles POST /api/child/agent/probe-master-url.
