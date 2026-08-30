@@ -2,6 +2,10 @@
 
 妙妙屋X 远程服务器代理程序。部署在子服务器上，负责与主控（miaomiaowux）通信，上报流量/速度数据，并接受主控的远程管理指令。
 
+- 官方网站：<https://miaomiaowux.com/>
+- 主控仓库：<https://github.com/niccfun/miaomiaox>
+- Agent 仓库：<https://github.com/niccfun/mmw-agent>
+
 ## 部署方式
 
 ### 方式 1:Docker(推荐)
@@ -20,7 +24,7 @@ docker run -d \
   -v $(pwd)/xray-config:/usr/local/etc/xray \
   -v $(pwd)/nginx-cert:/etc/nginx/cert \
   -v $(pwd)/nginx-servers:/etc/nginx/servers \
-ghcr.io/nuxproio/mmw-agent:latest
+ghcr.io/niccfun/mmw-agent:latest
 ```
 
 或用 [docker-compose.yml](docker-compose.yml):
@@ -40,8 +44,7 @@ docker compose up -d
 
 ```bash
 # 主控 UI 给的安装命令,大致形如:
-curl -sL https://raw.githubusercontent.com/nuxproio/mmw-agent/main/install.sh | bash -s -- \
-    --master https://master.example.com --token xxxxx
+curl -fsSL "https://master.example.com/api/remote/install.sh?..." | bash
 ```
 
 
@@ -54,7 +57,7 @@ curl -sL https://raw.githubusercontent.com/nuxproio/mmw-agent/main/install.sh | 
 - 🛠️ fix: nginx配置兜底
 - 🛠️ fix: 级联删除入站
 - 🛠️ fix: agent卸载失败
-- 🔒 保持本地永久许可证授权逻辑及 `nuxproio/mmw-agent` 更新源
+- 🔒 保持本地永久许可证授权逻辑及 `niccfun/mmw-agent` 更新源
 
 ### v0.5.0-v0.5.8 (上游版本)
 - 上游期间的 Guard、租约和许可证链路未合入本分支

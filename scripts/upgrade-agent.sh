@@ -18,7 +18,7 @@
 #
 set -euo pipefail
 
-REPO="nuxproio/mmw-agent"
+REPO="niccfun/mmw-agent"
 BIN="/usr/local/bin/mmw-agent"
 TARGET="${1:-latest}"
 

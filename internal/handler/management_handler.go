@@ -1231,7 +1231,7 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		defer nginxInstalling.Store(false)
 
 		cmd := exec.Command("bash", "-c",
-			`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash`)
+			`curl -fsSL https://raw.githubusercontent.com/niccfun/miaomiaox/main/install-nginx.sh | bash`)
 		cmd.Env = os.Environ()
 
 		var stdout, stderr bytes.Buffer
@@ -1270,7 +1270,7 @@ func (h *ManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.Request
 	log.Printf("[Manage] Removing Nginx...")
 
 	cmd := exec.Command("bash", "-c",
-		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/uninstall-nginx.sh | bash -s -- -y`)
+		`curl -fsSL https://raw.githubusercontent.com/niccfun/miaomiaox/main/uninstall-nginx.sh | bash -s -- -y`)
 	cmd.Env = os.Environ()
 
 	var stdout, stderr bytes.Buffer
@@ -5511,7 +5511,7 @@ func (h *ManageHandler) HandleNginxInstallStream(w http.ResponseWriter, r *http.
 
 	log.Printf("[Manage] Starting Nginx install (stream)...")
 	cmd := exec.CommandContext(r.Context(), "bash", "-c",
-		`set -e; SCRIPT=$(mktemp); curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh -o "$SCRIPT"; bash "$SCRIPT"; rm -f "$SCRIPT"`)
+		`set -e; SCRIPT=$(mktemp); curl -fsSL https://raw.githubusercontent.com/niccfun/miaomiaox/main/install-nginx.sh -o "$SCRIPT"; bash "$SCRIPT"; rm -f "$SCRIPT"`)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Nginx installed successfully")
 
@@ -5531,7 +5531,7 @@ func (h *ManageHandler) HandleNginxRemoveStream(w http.ResponseWriter, r *http.R
 	}
 	log.Printf("[Manage] Starting Nginx remove (stream)...")
 	cmd := exec.CommandContext(r.Context(), "bash", "-c",
-		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/uninstall-nginx.sh | bash -s -- -y`)
+		`curl -fsSL https://raw.githubusercontent.com/niccfun/miaomiaox/main/uninstall-nginx.sh | bash -s -- -y`)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Nginx removed successfully")
 }
@@ -5571,9 +5571,9 @@ esac
 # 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 会快速失败(近乎即时,
 # 非超时)后降级到 ghproxy / gh-proxy(v4+v6 双栈反代)。
 MIRRORS=(
-    "https://github.com/nuxproio/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://gh-proxy.com/https://github.com/nuxproio/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://mirror.ghproxy.com/https://github.com/nuxproio/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://github.com/niccfun/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://gh-proxy.com/https://github.com/niccfun/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://mirror.ghproxy.com/https://github.com/niccfun/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 )
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then

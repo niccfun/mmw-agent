@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   mmw-agent:
-    image: ghcr.io/nuxproio/mmw-agent:latest
+    image: ghcr.io/niccfun/mmw-agent:latest
     container_name: mmw-agent
     restart: unless-stopped
 
